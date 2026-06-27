@@ -1,0 +1,13 @@
+{
+  "date": "2026-06-27",
+  "slug": "demo-vscode",
+  "skill_areas": [
+    "backend"
+  ],
+  "prompt_score": 8,
+  "code_score": 5,
+  "delta_from_raw": 10,
+  "iterations": 2,
+  "time_mins": 6,
+  "first_output_kept": true
+}

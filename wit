@@ -24,12 +24,33 @@ _section() { print -P "\n%B%F{blue}$*%f%b" }
 
 # ── repo root detection ───────────────────────────────────────────────────────
 _repo_root() {
-  git rev-parse --show-toplevel 2>/dev/null || _err "Not inside a git repo. Run: git init"
+  git rev-parse --show-toplevel 2>/dev/null
 }
 
 _wit_root() {
-  local root=$(_repo_root)
+  local root
+  root=$(_repo_root) || _err "Not inside a git repo. Run: git init"
   echo "$root"
+}
+
+_latest_open_session() {
+  local root=$1
+  local session_dir=""
+  local latest_time=0
+
+  for d in "$root/sessions"/*/; do
+    [[ -f "$d/meta.json" ]] || continue
+    local rel="sessions/$(basename "$d")"
+    if git -C "$root" status --porcelain "$rel" | grep -q .; then
+      local mtime=$(stat -f %m "$d/meta.json" 2>/dev/null || stat -c %Y "$d/meta.json" 2>/dev/null)
+      if (( mtime > latest_time )); then
+        latest_time=$mtime
+        session_dir=$d
+      fi
+    fi
+  done
+
+  [[ -n "$session_dir" ]] && echo "$session_dir"
 }
 
 # ── wit init ──────────────────────────────────────────────────────────────────
@@ -69,6 +90,8 @@ A git-based log of prompt and code quality over time.
 ## workflow
 ```
 wit new <slug> [tags...]   # start a session
+wit work                   # record terminal work into current session
+wit event <name> [value]   # append a structured event to current session
 wit commit                 # score + commit
 wit log                    # view history
 wit status                 # current open session
@@ -95,6 +118,63 @@ EOF
   fi
 
   _ok "wit ready. Start your first session with: wit new <slug> [tags...]"
+}
+
+# ── wit work ──────────────────────────────────────────────────────────────────
+cmd_work() {
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+  command -v script &>/dev/null || _err "Missing 'script' command; cannot record terminal transcript"
+
+  local log_file="$session_dir/terminal_work.log"
+  local slug=$(jq -r '.slug' "$session_dir/meta.json")
+
+  _section "Recording terminal work for: $slug"
+  _info "Transcript file: ${log_file#$root/}"
+  _info "Type 'exit' to stop recording and return to your shell"
+
+  # script opens a nested interactive shell and records commands + output.
+  script -q "$log_file"
+
+  _ok "Saved terminal transcript: ${log_file#$root/}"
+}
+
+# ── wit event ─────────────────────────────────────────────────────────────────
+cmd_event() {
+  [[ $# -lt 1 ]] && _err "Usage: wit event <name> [value]\n  e.g. wit event test.pass\n  e.g. wit event file.change src/app.ts"
+
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local event_name=$1
+  shift
+  local event_value="${*:-}"
+  local event_file="$session_dir/events.jsonl"
+  local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local session_slug=$(jq -r '.slug' "$session_dir/meta.json")
+
+  local event_line
+  if [[ -n "$event_value" ]]; then
+    event_line=$(jq -nc \
+      --arg ts "$ts" \
+      --arg event "$event_name" \
+      --arg value "$event_value" \
+      --arg slug "$session_slug" \
+      '{ts:$ts,event:$event,value:$value,slug:$slug}')
+  else
+    event_line=$(jq -nc \
+      --arg ts "$ts" \
+      --arg event "$event_name" \
+      --arg slug "$session_slug" \
+      '{ts:$ts,event:$event,slug:$slug}')
+  fi
+
+  echo "$event_line" >> "$event_file"
+  _ok "Event saved: $event_name${event_value:+ ($event_value)}"
 }
 
 # ── wit new ───────────────────────────────────────────────────────────────────
@@ -188,23 +268,7 @@ EOF
 # ── wit commit ────────────────────────────────────────────────────────────────
 cmd_commit() {
   local root=$(_wit_root)
-
-  # find the most recently modified uncommitted session
-  local session_dir=""
-  local latest_time=0
-
-  for d in "$root/sessions"/*/; do
-    [[ -f "$d/meta.json" ]] || continue
-    # check if this session has already been committed
-    local rel="sessions/$(basename $d)"
-    if git -C "$root" status --porcelain "$rel" | grep -q .; then
-      local mtime=$(stat -f %m "$d/meta.json" 2>/dev/null || stat -c %Y "$d/meta.json" 2>/dev/null)
-      if (( mtime > latest_time )); then
-        latest_time=$mtime
-        session_dir=$d
-      fi
-    fi
-  done
+  local session_dir=$(_latest_open_session "$root")
 
   [[ -z "$session_dir" ]] && _err "No uncommitted session found. Start one with: wit new <slug>"
 
@@ -378,12 +442,17 @@ ${BOLD}wit${RESET} — prompt & code quality tracker
 ${BOLD}COMMANDS${RESET}
   ${CYAN}wit init${RESET}                    scaffold the repo structure
   ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
+  ${CYAN}wit work${RESET}                    record terminal work into open session
+  ${CYAN}wit event${RESET} <name> [value]    append event to current open session
   ${CYAN}wit commit${RESET}                  score + append to scores.jsonl + git commit
   ${CYAN}wit log${RESET}                     pretty-print session history + averages
   ${CYAN}wit status${RESET}                  show open (uncommitted) sessions
 
 ${BOLD}EXAMPLES${RESET}
   wit new auth-flow backend jwt
+  wit work
+  wit event file.change src/auth.ts
+  wit event test.pass
   wit new login-form frontend react
   wit commit
   wit log
@@ -402,6 +471,8 @@ shift 2>/dev/null || true
 case $cmd in
   init)   cmd_init "$@"   ;;
   new)    cmd_new "$@"    ;;
+  work)   cmd_work "$@"   ;;
+  event)  cmd_event "$@"  ;;
   commit) cmd_commit "$@" ;;
   log)    cmd_log "$@"    ;;
   status) cmd_status "$@" ;;

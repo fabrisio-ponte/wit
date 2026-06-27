@@ -1,0 +1,59 @@
+{
+  "name": "vscode-wit-bridge",
+  "displayName": "Wit Bridge",
+  "description": "Connects VS Code workflows to the wit CLI tracker.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:wit.startSession",
+    "onCommand:wit.recordEvent",
+    "onCommand:wit.openCommit",
+    "onCommand:wit.showStatus"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "wit.startSession",
+        "title": "Wit: Start Session"
+      },
+      {
+        "command": "wit.recordEvent",
+        "title": "Wit: Record Event"
+      },
+      {
+        "command": "wit.openCommit",
+        "title": "Wit: Commit Session"
+      },
+      {
+        "command": "wit.showStatus",
+        "title": "Wit: Status"
+      }
+    ],
+    "configuration": {
+      "title": "Wit Bridge",
+      "properties": {
+        "wit.cliPath": {
+          "type": "string",
+          "default": "./wit",
+          "description": "Path to the wit CLI command to execute."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.14.2",
+    "typescript": "^5.5.4"
+  }
+}

@@ -1,1 +1,2 @@
 {"date":"2026-06-27","slug":"demo-flow","prompt_score":8,"code_score":5,"iterations":3,"time_mins":20,"first_output_kept":false,"delta_from_raw":20,"skill_areas":["backend"]}
+{"date":"2026-06-27","slug":"demo-vscode","prompt_score":8,"code_score":5,"iterations":2,"time_mins":6,"first_output_kept":true,"delta_from_raw":10,"skill_areas":["backend"]}
