@@ -1,0 +1,410 @@
+#!/usr/bin/env zsh
+# wit — skill tracking CLI
+# mirrors git's vocabulary, sits alongside it
+# usage: wit new <slug> [tags...]  |  wit commit  |  wit log  |  wit status
+
+set -euo pipefail
+
+# ── colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+_info()    { print -P "%F{cyan}→%f $*" }
+_ok()      { print -P "%F{green}✓%f $*" }
+_warn()    { print -P "%F{yellow}⚠%f $*" }
+_err()     { print -P "%F{red}✗%f $*" >&2; exit 1 }
+_section() { print -P "\n%B%F{blue}$*%f%b" }
+
+# ── repo root detection ───────────────────────────────────────────────────────
+_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || _err "Not inside a git repo. Run: git init"
+}
+
+_wit_root() {
+  local root=$(_repo_root)
+  echo "$root"
+}
+
+# ── wit init ──────────────────────────────────────────────────────────────────
+cmd_init() {
+  local root=${1:-$PWD}
+  _section "Initialising wit in $root"
+
+  mkdir -p "$root/sessions"
+  mkdir -p "$root/metrics"
+
+  # scores.jsonl — the database
+  if [[ ! -f "$root/metrics/scores.jsonl" ]]; then
+    touch "$root/metrics/scores.jsonl"
+    _ok "Created metrics/scores.jsonl"
+  fi
+
+  # trends.md — human-readable summary, updated by wit log
+  if [[ ! -f "$root/metrics/trends.md" ]]; then
+    cat > "$root/metrics/trends.md" <<'EOF'
+# Trends
+
+Updated automatically by `wit log`.
+
+## Summary
+_No sessions committed yet._
+EOF
+    _ok "Created metrics/trends.md"
+  fi
+
+  # README
+  if [[ ! -f "$root/README.md" ]]; then
+    cat > "$root/README.md" <<'EOF'
+# skill-tracker
+
+A git-based log of prompt and code quality over time.
+
+## workflow
+```
+wit new <slug> [tags...]   # start a session
+wit commit                 # score + commit
+wit log                    # view history
+wit status                 # current open session
+```
+
+## session structure
+```
+sessions/YYYY-MM-DD_<slug>/
+  prompt.md        — the exact prompt sent
+  output_raw.*     — claude's output, unedited
+  output_final.*   — what you actually kept
+  meta.json        — scores, tags, timing
+  reflection.md    — what worked / failed
+```
+EOF
+    _ok "Created README.md"
+  fi
+
+  # initial commit if repo is empty
+  if ! git -C "$root" log --oneline -1 &>/dev/null; then
+    git -C "$root" add .
+    git -C "$root" commit -m "init: wit scaffold"
+    _ok "Initial commit done"
+  fi
+
+  _ok "wit ready. Start your first session with: wit new <slug> [tags...]"
+}
+
+# ── wit new ───────────────────────────────────────────────────────────────────
+cmd_new() {
+  [[ $# -lt 1 ]] && _err "Usage: wit new <slug> [tags...]\n  e.g. wit new auth-flow backend jwt"
+
+  local root=$(_wit_root)
+  local slug=$1; shift
+  local tags=("$@")
+  local date=$(date +%Y-%m-%d)
+  local dir="$root/sessions/${date}_${slug}"
+
+  [[ -d "$dir" ]] && _err "Session already exists: $dir"
+
+  _section "New session: $slug"
+  mkdir -p "$dir"
+
+  # ── prompt.md ──
+  cat > "$dir/prompt.md" <<EOF
+# $slug
+_${date}_
+
+## goal
+<!-- one sentence: what are you trying to build? -->
+
+## prompt
+<!-- paste the exact prompt you sent — no cleanup -->
+
+## followups
+<!-- any clarifying prompts you sent after (leave blank if none) -->
+EOF
+
+  # ── meta.json ──
+  local tags_json
+  if [[ ${#tags[@]} -gt 0 ]]; then
+    tags_json=$(printf '"%s",' "${tags[@]}" | sed 's/,$//')
+    tags_json="[$tags_json]"
+  else
+    tags_json='[]'
+  fi
+
+  cat > "$dir/meta.json" <<EOF
+{
+  "date": "$date",
+  "slug": "$slug",
+  "skill_areas": $tags_json,
+  "prompt_score": null,
+  "code_score": null,
+  "delta_from_raw": null,
+  "iterations": null,
+  "time_mins": null,
+  "first_output_kept": null
+}
+EOF
+
+  # ── output files ──
+  touch "$dir/output_raw.txt"
+  touch "$dir/output_final.txt"
+
+  # ── reflection.md ──
+  cat > "$dir/reflection.md" <<EOF
+# reflection — $slug
+_${date}_
+
+## what worked
+<!-- prompt patterns or framing that landed well -->
+
+## what failed
+<!-- where the prompt was vague, where code needed fixing -->
+
+## pattern noticed
+<!-- any recurring signal across sessions (optional) -->
+
+## next experiment
+<!-- one concrete thing to try differently next time -->
+EOF
+
+  _ok "Scaffolded: sessions/${date}_${slug}/"
+  _info "Fill in the files, then run: wit commit"
+
+  # open in VS Code
+  if command -v code &>/dev/null; then
+    code "$dir"
+    _ok "Opened in VS Code"
+  else
+    _warn "VS Code CLI (code) not found — open the folder manually"
+    _info "$dir"
+  fi
+}
+
+# ── wit commit ────────────────────────────────────────────────────────────────
+cmd_commit() {
+  local root=$(_wit_root)
+
+  # find the most recently modified uncommitted session
+  local session_dir=""
+  local latest_time=0
+
+  for d in "$root/sessions"/*/; do
+    [[ -f "$d/meta.json" ]] || continue
+    # check if this session has already been committed
+    local rel="sessions/$(basename $d)"
+    if git -C "$root" status --porcelain "$rel" | grep -q .; then
+      local mtime=$(stat -f %m "$d/meta.json" 2>/dev/null || stat -c %Y "$d/meta.json" 2>/dev/null)
+      if (( mtime > latest_time )); then
+        latest_time=$mtime
+        session_dir=$d
+      fi
+    fi
+  done
+
+  [[ -z "$session_dir" ]] && _err "No uncommitted session found. Start one with: wit new <slug>"
+
+  local meta="$session_dir/meta.json"
+  local slug=$(jq -r '.slug' "$meta")
+  local date=$(jq -r '.date' "$meta")
+
+  _section "Committing session: $slug"
+
+  # ── interactive scoring if nulls remain ──
+  local prompt_score=$(jq -r '.prompt_score' "$meta")
+  local code_score=$(jq -r '.code_score' "$meta")
+  local iterations=$(jq -r '.iterations' "$meta")
+  local time_mins=$(jq -r '.time_mins' "$meta")
+  local first_kept=$(jq -r '.first_output_kept' "$meta")
+  local delta=$(jq -r '.delta_from_raw' "$meta")
+
+  _prompt_score() {
+    local field=$1 label=$2 current=$3
+    if [[ "$current" == "null" ]]; then
+      print -n "  $label (1-10): "
+      read val
+      echo "$val"
+    else
+      echo "$current"
+    fi
+  }
+
+  if [[ "$prompt_score" == "null" ]]; then
+    print -P "\n%B%F{yellow}Score this session:%f%b"
+    print -n "  prompt clarity (1-10): "; read prompt_score
+    print -n "  code quality  (1-10): "; read code_score
+    print -n "  iterations needed:    "; read iterations
+    print -n "  time (mins):          "; read time_mins
+    print -n "  first output kept? (true/false): "; read first_kept
+    print -n "  edits made to raw output (0=none): "; read delta
+
+    # write back to meta.json
+    local tmp=$(mktemp)
+    jq \
+      --argjson ps "$prompt_score" \
+      --argjson cs "$code_score" \
+      --argjson it "$iterations" \
+      --argjson tm "$time_mins" \
+      --argjson fk "$first_kept" \
+      --argjson dr "$delta" \
+      '.prompt_score=$ps | .code_score=$cs | .iterations=$it | .time_mins=$tm | .first_output_kept=$fk | .delta_from_raw=$dr' \
+      "$meta" > "$tmp" && mv "$tmp" "$meta"
+    _ok "Scores written to meta.json"
+  fi
+
+  # ── append to scores.jsonl ──
+  local areas=$(jq -c '.skill_areas' "$meta")
+  local score_line=$(jq -nc \
+    --arg date "$date" \
+    --arg slug "$slug" \
+    --argjson ps "$prompt_score" \
+    --argjson cs "$code_score" \
+    --argjson it "$iterations" \
+    --argjson tm "$time_mins" \
+    --argjson fk "$first_kept" \
+    --argjson dr "$delta" \
+    --argjson areas "$areas" \
+    '{date:$date,slug:$slug,prompt_score:$ps,code_score:$cs,iterations:$it,time_mins:$tm,first_output_kept:$fk,delta_from_raw:$dr,skill_areas:$areas}')
+
+  echo "$score_line" >> "$root/metrics/scores.jsonl"
+  _ok "Appended to metrics/scores.jsonl"
+
+  # ── git commit ──
+  local areas_flat=$(jq -r '.skill_areas[]?' "$meta" | tr '\n' ' ' | sed 's/ $//')
+  local msg="session: $date | $slug | prompt ${prompt_score}/10 code ${code_score}/10"
+  [[ -n "$areas_flat" ]] && msg="$msg | $areas_flat"
+
+  git -C "$root" add .
+  git -C "$root" commit -m "$msg"
+  _ok "git commit: $msg"
+}
+
+# ── wit log ───────────────────────────────────────────────────────────────────
+cmd_log() {
+  local root=$(_wit_root)
+  local scores="$root/metrics/scores.jsonl"
+
+  [[ ! -f "$scores" ]] && _err "No scores.jsonl found. Run wit init first."
+  [[ ! -s "$scores" ]]  && { _warn "No sessions committed yet."; return; }
+
+  _section "Session history"
+
+  local count=0
+  local total_prompt=0
+  local total_code=0
+
+  while IFS= read -r line; do
+    local date=$(echo "$line" | jq -r '.date')
+    local slug=$(echo "$line" | jq -r '.slug')
+    local ps=$(echo "$line"   | jq -r '.prompt_score')
+    local cs=$(echo "$line"   | jq -r '.code_score')
+    local it=$(echo "$line"   | jq -r '.iterations')
+    local tm=$(echo "$line"   | jq -r '.time_mins')
+    local areas=$(echo "$line" | jq -r '.skill_areas[]?' | tr '\n' ' ')
+
+    # score colour
+    local p_col=$RESET
+    local c_col=$RESET
+    (( ps >= 8 )) && p_col=$GREEN || (( ps >= 6 )) && p_col=$YELLOW || p_col=$RED
+    (( cs >= 8 )) && c_col=$GREEN || (( cs >= 6 )) && c_col=$YELLOW || c_col=$RED
+
+    printf "  ${DIM}%s${RESET}  ${BOLD}%-24s${RESET}  prompt ${p_col}%2s/10${RESET}  code ${c_col}%2s/10${RESET}  ${DIM}%s iter · %s min · %s${RESET}\n" \
+      "$date" "$slug" "$ps" "$cs" "$it" "$tm" "$areas"
+
+    (( count++ ))
+    (( total_prompt += ps ))
+    (( total_code   += cs ))
+  done < "$scores"
+
+  # averages
+  if (( count > 0 )); then
+    local avg_p=$(echo "scale=1; $total_prompt / $count" | bc)
+    local avg_c=$(echo "scale=1; $total_code   / $count" | bc)
+    _section "Averages across $count sessions"
+    printf "  prompt %.1f/10   code %.1f/10\n" "$avg_p" "$avg_c"
+  fi
+
+  # trend (last 5 vs previous 5)
+  if (( count >= 6 )); then
+    _section "Trend (last 5 vs previous 5)"
+    local last5=$(tail -5  "$scores" | jq -s '[.[].prompt_score] | add/length')
+    local prev5=$(tail -10 "$scores" | head -5 | jq -s '[.[].prompt_score] | add/length')
+    local diff=$(echo "scale=1; $last5 - $prev5" | bc)
+    if (( $(echo "$diff > 0" | bc -l) )); then
+      printf "  prompt ${GREEN}+%s${RESET} vs prior 5 sessions\n" "$diff"
+    elif (( $(echo "$diff < 0" | bc -l) )); then
+      printf "  prompt ${RED}%s${RESET} vs prior 5 sessions\n" "$diff"
+    else
+      printf "  prompt ${DIM}flat${RESET} vs prior 5 sessions\n"
+    fi
+  fi
+}
+
+# ── wit status ────────────────────────────────────────────────────────────────
+cmd_status() {
+  local root=$(_wit_root)
+
+  _section "wit status"
+
+  # uncommitted session folders
+  local found=0
+  for d in "$root/sessions"/*/; do
+    [[ -f "$d/meta.json" ]] || continue
+    local rel="sessions/$(basename $d)"
+    if git -C "$root" status --porcelain "$rel" | grep -q .; then
+      local slug=$(jq -r '.slug' "$d/meta.json")
+      local ps=$(jq -r '.prompt_score' "$d/meta.json")
+      _info "Open session: ${BOLD}$slug${RESET} $([ "$ps" = "null" ] && echo "${YELLOW}(not yet scored)${RESET}" || echo "prompt ${ps}/10")"
+      found=1
+    fi
+  done
+
+  (( found == 0 )) && _ok "Nothing open. Start one with: wit new <slug> [tags...]"
+
+  # quick git status
+  echo ""
+  git -C "$root" status --short
+}
+
+# ── wit help ──────────────────────────────────────────────────────────────────
+cmd_help() {
+  print -P "
+${BOLD}wit${RESET} — prompt & code quality tracker
+
+${BOLD}COMMANDS${RESET}
+  ${CYAN}wit init${RESET}                    scaffold the repo structure
+  ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
+  ${CYAN}wit commit${RESET}                  score + append to scores.jsonl + git commit
+  ${CYAN}wit log${RESET}                     pretty-print session history + averages
+  ${CYAN}wit status${RESET}                  show open (uncommitted) sessions
+
+${BOLD}EXAMPLES${RESET}
+  wit new auth-flow backend jwt
+  wit new login-form frontend react
+  wit commit
+  wit log
+
+${BOLD}INSTALL${RESET}
+  chmod +x wit
+  sudo mv wit /usr/local/bin/wit    # system-wide
+  # or: add repo root to PATH
+"
+}
+
+# ── router ────────────────────────────────────────────────────────────────────
+local cmd=${1:-help}
+shift 2>/dev/null || true
+
+case $cmd in
+  init)   cmd_init "$@"   ;;
+  new)    cmd_new "$@"    ;;
+  commit) cmd_commit "$@" ;;
+  log)    cmd_log "$@"    ;;
+  status) cmd_status "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *) _err "Unknown command: $cmd\nRun: wit help" ;;
+esac
