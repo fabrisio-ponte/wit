@@ -1,0 +1,17 @@
+{
+  "date": "2026-06-27",
+  "slug": "auto-lite",
+  "skill_areas": [
+    "backend"
+  ],
+  "prompt_score": 7,
+  "code_score": 10,
+  "drift_score": 1,
+  "session_score": 6,
+  "delta_from_raw": null,
+  "iterations": null,
+  "time_mins": null,
+  "first_output_kept": null,
+  "scoring_mode": "heuristic",
+  "score_reasoning": "heuristic: prompt_words=8, final_lines=1, overlap=7%, pass_events=1, fail_events=0"
+}

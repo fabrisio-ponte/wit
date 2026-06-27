@@ -53,6 +53,154 @@ _latest_open_session() {
   [[ -n "$session_dir" ]] && echo "$session_dir"
 }
 
+_clamp_1_10() {
+  local n=$1
+  (( n < 1 )) && n=1
+  (( n > 10 )) && n=10
+  echo "$n"
+}
+
+_extract_section() {
+  local file=$1
+  local header=$2
+  [[ -f "$file" ]] || return 0
+  awk -v h="$header" '
+    BEGIN { in_section=0 }
+    $0 ~ "^##[[:space:]]+" h "[[:space:]]*$" { in_section=1; next }
+    /^##[[:space:]]+/ { if (in_section) exit }
+    { if (in_section) print }
+  ' "$file"
+}
+
+_word_count_text() {
+  local text=$1
+  print -r -- "$text" | tr -cs '[:alnum:]' '\n' | awk 'NF { c++ } END { print c+0 }'
+}
+
+_nonempty_lines_file() {
+  local file=$1
+  [[ -f "$file" ]] || { echo 0; return; }
+  grep -cve '^[[:space:]]*$' "$file" 2>/dev/null || echo 0
+}
+
+_token_overlap_percent() {
+  local a=$1
+  local b=$2
+  local fa=$(mktemp)
+  local fb=$(mktemp)
+  print -r -- "$a" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fa"
+  print -r -- "$b" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fb"
+
+  local common=$(comm -12 "$fa" "$fb" | wc -l | tr -d ' ')
+  local total=$(cat "$fa" "$fb" | sort -u | wc -l | tr -d ' ')
+  rm -f "$fa" "$fb"
+
+  if (( total == 0 )); then
+    echo 50
+    return
+  fi
+
+  echo $(( (common * 100) / total ))
+}
+
+_score_session_heuristic() {
+  local session_dir=$1
+  local meta="$session_dir/meta.json"
+  local prompt_file="$session_dir/prompt.md"
+  local final_file="$session_dir/output_final.txt"
+  local reflection_file="$session_dir/reflection.md"
+  local events_file="$session_dir/events.jsonl"
+
+  local goal_text=$(_extract_section "$prompt_file" "goal")
+  local prompt_text=$(_extract_section "$prompt_file" "prompt")
+  local followups_text=$(_extract_section "$prompt_file" "followups")
+  local final_text=""
+  [[ -f "$final_file" ]] && final_text=$(cat "$final_file")
+
+  local goal_words=$(_word_count_text "$goal_text")
+  local prompt_words=$(_word_count_text "$prompt_text")
+  local followups_words=$(_word_count_text "$followups_text")
+  local final_lines=$(_nonempty_lines_file "$final_file")
+
+  local prompt_score=5
+  (( goal_words >= 5 )) && (( prompt_score += 1 )) || (( prompt_score -= 1 ))
+  (( prompt_words >= 25 )) && (( prompt_score += 1 ))
+  (( prompt_words >= 70 )) && (( prompt_score += 1 ))
+  print -r -- "$prompt_text" | grep -Eiq '(must|should|acceptance|criteria|output|format|constraint)' && (( prompt_score += 1 ))
+  print -r -- "$prompt_text" | grep -Eiq '(language|framework|stack|api|file|test)' && (( prompt_score += 1 ))
+  (( followups_words > 0 )) && (( prompt_score += 1 ))
+  prompt_score=$(_clamp_1_10 "$prompt_score")
+
+  local code_score=5
+  (( final_lines >= 8 )) && (( code_score += 1 ))
+  (( final_lines >= 25 )) && (( code_score += 1 ))
+
+  local worked_text=$(_extract_section "$reflection_file" "what worked")
+  local failed_text=$(_extract_section "$reflection_file" "what failed")
+  local pattern_text=$(_extract_section "$reflection_file" "pattern noticed")
+  local next_text=$(_extract_section "$reflection_file" "next experiment")
+  (( $(_word_count_text "$worked_text") > 0 )) && (( code_score += 1 ))
+  (( $(_word_count_text "$failed_text") > 0 )) && (( code_score += 1 ))
+  (( $(_word_count_text "$pattern_text") > 0 )) && (( code_score += 1 ))
+  (( $(_word_count_text "$next_text") > 0 )) && (( code_score += 1 ))
+
+  local pass_events=0
+  local fail_events=0
+  if [[ -f "$events_file" ]]; then
+    pass_events=$(grep -Ec '"event":"(test.pass|build.pass)"' "$events_file" || true)
+    fail_events=$(grep -Ec '"event":"(test.fail|build.fail)"' "$events_file" || true)
+  fi
+  (( pass_events > 0 )) && (( code_score += 1 ))
+  (( fail_events > 0 )) && (( code_score -= 1 ))
+
+  local first_kept=$(jq -r '.first_output_kept' "$meta")
+  [[ "$first_kept" == "true" ]] && (( code_score += 1 ))
+
+  local delta=$(jq -r '.delta_from_raw' "$meta")
+  if [[ "$delta" != "null" ]]; then
+    if (( delta <= 3 )); then
+      (( code_score += 1 ))
+    elif (( delta >= 10 )); then
+      (( code_score -= 1 ))
+    fi
+  fi
+
+  local iterations=$(jq -r '.iterations' "$meta")
+  if [[ "$iterations" != "null" ]]; then
+    (( iterations <= 2 )) && (( code_score += 1 ))
+    (( iterations >= 6 )) && (( code_score -= 1 ))
+  fi
+
+  code_score=$(_clamp_1_10 "$code_score")
+
+  local overlap=$(_token_overlap_percent "$goal_text" "$final_text")
+  local drift_score=$(( overlap / 10 ))
+  (( drift_score == 0 )) && drift_score=1
+  print -r -- "$failed_text" | grep -Eiq '(drift|scope creep|changed direction|off track)' && (( drift_score -= 1 ))
+  drift_score=$(_clamp_1_10 "$drift_score")
+
+  local session_score=$(( (prompt_score + code_score + drift_score) / 3 ))
+  session_score=$(_clamp_1_10 "$session_score")
+
+  local reason="heuristic: prompt_words=$prompt_words, final_lines=$final_lines, overlap=${overlap}%, pass_events=$pass_events, fail_events=$fail_events"
+
+  local tmp=$(mktemp)
+  jq \
+    --argjson ps "$prompt_score" \
+    --argjson cs "$code_score" \
+    --argjson ds "$drift_score" \
+    --argjson ss "$session_score" \
+    --arg mode "heuristic" \
+    --arg reason "$reason" \
+    '.prompt_score=$ps
+    | .code_score=$cs
+    | .drift_score=$ds
+    | .session_score=$ss
+    | .scoring_mode=$mode
+    | .score_reasoning=$reason' \
+    "$meta" > "$tmp" && mv "$tmp" "$meta"
+}
+
 # ── wit init ──────────────────────────────────────────────────────────────────
 cmd_init() {
   local root=${1:-$PWD}
@@ -223,10 +371,14 @@ EOF
   "skill_areas": $tags_json,
   "prompt_score": null,
   "code_score": null,
+  "drift_score": null,
+  "session_score": null,
   "delta_from_raw": null,
   "iterations": null,
   "time_mins": null,
-  "first_output_kept": null
+  "first_output_kept": null,
+  "scoring_mode": null,
+  "score_reasoning": null
 }
 EOF
 
@@ -265,6 +417,28 @@ EOF
   fi
 }
 
+# ── wit score ─────────────────────────────────────────────────────────────────
+cmd_score() {
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local meta="$session_dir/meta.json"
+  local slug=$(jq -r '.slug' "$meta")
+
+  _section "Auto-scoring session: $slug"
+  _score_session_heuristic "$session_dir"
+
+  local prompt_score=$(jq -r '.prompt_score' "$meta")
+  local code_score=$(jq -r '.code_score' "$meta")
+  local drift_score=$(jq -r '.drift_score' "$meta")
+  local session_score=$(jq -r '.session_score' "$meta")
+
+  _ok "Scores updated (heuristic)"
+  _info "prompt ${prompt_score}/10 · code ${code_score}/10 · drift ${drift_score}/10 · session ${session_score}/10"
+}
+
 # ── wit commit ────────────────────────────────────────────────────────────────
 cmd_commit() {
   local root=$(_wit_root)
@@ -278,9 +452,19 @@ cmd_commit() {
 
   _section "Committing session: $slug"
 
-  # ── interactive scoring if nulls remain ──
+  # ── auto-score first for lightweight default workflow ──
   local prompt_score=$(jq -r '.prompt_score' "$meta")
   local code_score=$(jq -r '.code_score' "$meta")
+  if [[ "$prompt_score" == "null" || "$code_score" == "null" ]]; then
+    _info "Auto-scoring with heuristic model..."
+    _score_session_heuristic "$session_dir"
+  fi
+
+  # ── interactive scoring only if nulls remain ──
+  local prompt_score=$(jq -r '.prompt_score' "$meta")
+  local code_score=$(jq -r '.code_score' "$meta")
+  local drift_score=$(jq -r '.drift_score' "$meta")
+  local session_score=$(jq -r '.session_score' "$meta")
   local iterations=$(jq -r '.iterations' "$meta")
   local time_mins=$(jq -r '.time_mins' "$meta")
   local first_kept=$(jq -r '.first_output_kept' "$meta")
@@ -320,19 +504,35 @@ cmd_commit() {
     _ok "Scores written to meta.json"
   fi
 
+  # refresh in case manual entry happened above
+  prompt_score=$(jq -r '.prompt_score' "$meta")
+  code_score=$(jq -r '.code_score' "$meta")
+  drift_score=$(jq -r '.drift_score' "$meta")
+  session_score=$(jq -r '.session_score' "$meta")
+  iterations=$(jq -r '.iterations' "$meta")
+  time_mins=$(jq -r '.time_mins' "$meta")
+  first_kept=$(jq -r '.first_output_kept' "$meta")
+  delta=$(jq -r '.delta_from_raw' "$meta")
+
   # ── append to scores.jsonl ──
   local areas=$(jq -c '.skill_areas' "$meta")
+  local scoring_mode=$(jq -r '.scoring_mode // "manual"' "$meta")
+  local score_reasoning=$(jq -r '.score_reasoning // ""' "$meta")
   local score_line=$(jq -nc \
     --arg date "$date" \
     --arg slug "$slug" \
     --argjson ps "$prompt_score" \
     --argjson cs "$code_score" \
+    --argjson ds "$drift_score" \
+    --argjson ss "$session_score" \
     --argjson it "$iterations" \
     --argjson tm "$time_mins" \
     --argjson fk "$first_kept" \
     --argjson dr "$delta" \
+    --arg mode "$scoring_mode" \
+    --arg reason "$score_reasoning" \
     --argjson areas "$areas" \
-    '{date:$date,slug:$slug,prompt_score:$ps,code_score:$cs,iterations:$it,time_mins:$tm,first_output_kept:$fk,delta_from_raw:$dr,skill_areas:$areas}')
+    '{date:$date,slug:$slug,prompt_score:$ps,code_score:$cs,drift_score:$ds,session_score:$ss,iterations:$it,time_mins:$tm,first_output_kept:$fk,delta_from_raw:$dr,scoring_mode:$mode,score_reasoning:$reason,skill_areas:$areas}')
 
   echo "$score_line" >> "$root/metrics/scores.jsonl"
   _ok "Appended to metrics/scores.jsonl"
@@ -444,6 +644,7 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
   ${CYAN}wit work${RESET}                    record terminal work into open session
   ${CYAN}wit event${RESET} <name> [value]    append event to current open session
+  ${CYAN}wit score${RESET}                   auto-score current open session (heuristic)
   ${CYAN}wit commit${RESET}                  score + append to scores.jsonl + git commit
   ${CYAN}wit log${RESET}                     pretty-print session history + averages
   ${CYAN}wit status${RESET}                  show open (uncommitted) sessions
@@ -453,6 +654,7 @@ ${BOLD}EXAMPLES${RESET}
   wit work
   wit event file.change src/auth.ts
   wit event test.pass
+  wit score
   wit new login-form frontend react
   wit commit
   wit log
@@ -473,6 +675,7 @@ case $cmd in
   new)    cmd_new "$@"    ;;
   work)   cmd_work "$@"   ;;
   event)  cmd_event "$@"  ;;
+  score)  cmd_score "$@"  ;;
   commit) cmd_commit "$@" ;;
   log)    cmd_log "$@"    ;;
   status) cmd_status "$@" ;;
