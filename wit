@@ -566,8 +566,11 @@ cmd_log() {
     local slug=$(echo "$line" | jq -r '.slug')
     local ps=$(echo "$line"   | jq -r '.prompt_score')
     local cs=$(echo "$line"   | jq -r '.code_score')
+    local ds=$(echo "$line"   | jq -r '.drift_score // "--"')
+    local ss=$(echo "$line"   | jq -r '.session_score // "--"')
     local it=$(echo "$line"   | jq -r '.iterations')
     local tm=$(echo "$line"   | jq -r '.time_mins')
+    local mode=$(echo "$line" | jq -r '.scoring_mode // "manual"')
     local areas=$(echo "$line" | jq -r '.skill_areas[]?' | tr '\n' ' ')
 
     # score colour
@@ -576,8 +579,8 @@ cmd_log() {
     (( ps >= 8 )) && p_col=$GREEN || (( ps >= 6 )) && p_col=$YELLOW || p_col=$RED
     (( cs >= 8 )) && c_col=$GREEN || (( cs >= 6 )) && c_col=$YELLOW || c_col=$RED
 
-    printf "  ${DIM}%s${RESET}  ${BOLD}%-24s${RESET}  prompt ${p_col}%2s/10${RESET}  code ${c_col}%2s/10${RESET}  ${DIM}%s iter · %s min · %s${RESET}\n" \
-      "$date" "$slug" "$ps" "$cs" "$it" "$tm" "$areas"
+    printf "  ${DIM}%s${RESET}  ${BOLD}%-24s${RESET}  prompt ${p_col}%2s/10${RESET}  code ${c_col}%2s/10${RESET}  drift %2s/10  session %2s/10  ${DIM}%s · %s iter · %s min · %s${RESET}\n" \
+      "$date" "$slug" "$ps" "$cs" "$ds" "$ss" "$mode" "$it" "$tm" "$areas"
 
     (( count++ ))
     (( total_prompt += ps ))
