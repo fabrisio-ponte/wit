@@ -80,7 +80,7 @@ _word_count_text() {
 _nonempty_lines_file() {
   local file=$1
   [[ -f "$file" ]] || { echo 0; return; }
-  grep -cve '^[[:space:]]*$' "$file" 2>/dev/null || echo 0
+  awk 'NF { c++ } END { print c+0 }' "$file"
 }
 
 _token_overlap_percent() {
@@ -103,6 +103,115 @@ _token_overlap_percent() {
   echo $(( (common * 100) / total ))
 }
 
+_iso_now_utc() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+_seconds_between_iso() {
+  local start=$1
+  local end=$2
+  local s_epoch
+  local e_epoch
+
+  s_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$start" "+%s" 2>/dev/null || true)
+  e_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$end" "+%s" 2>/dev/null || true)
+
+  if [[ -z "$s_epoch" || -z "$e_epoch" ]]; then
+    echo 0
+    return
+  fi
+
+  local diff=$(( e_epoch - s_epoch ))
+  (( diff < 0 )) && diff=0
+  echo "$diff"
+}
+
+_session_metrics_autofill() {
+  local session_dir=$1
+  local meta="$session_dir/meta.json"
+  local events_file="$session_dir/events.jsonl"
+  local prompts_file="$session_dir/prompts.jsonl"
+  local raw_file="$session_dir/output_raw.txt"
+  local final_file="$session_dir/output_final.txt"
+
+  local started_at
+  started_at=$(jq -r '.started_at // empty' "$meta")
+  local ended_at=$(_iso_now_utc)
+
+  local time_mins
+  time_mins=$(jq -r '.time_mins' "$meta")
+  if [[ "$time_mins" == "null" ]]; then
+    if [[ -n "$started_at" ]]; then
+      local secs=$(_seconds_between_iso "$started_at" "$ended_at")
+      local mins=$(( (secs + 59) / 60 ))
+      (( mins < 1 )) && mins=1
+      time_mins=$mins
+    else
+      time_mins=1
+    fi
+  fi
+
+  local iterations
+  iterations=$(jq -r '.iterations' "$meta")
+  if [[ "$iterations" == "null" ]]; then
+    local event_count=0
+    local prompt_count=0
+    [[ -f "$events_file" ]] && event_count=$(wc -l < "$events_file" | tr -d ' ')
+    [[ -f "$prompts_file" ]] && prompt_count=$(wc -l < "$prompts_file" | tr -d ' ')
+    local total=$(( event_count + prompt_count ))
+    if (( total <= 1 )); then
+      iterations=1
+    elif (( total <= 4 )); then
+      iterations=2
+    elif (( total <= 8 )); then
+      iterations=3
+    else
+      iterations=4
+    fi
+  fi
+
+  local delta
+  delta=$(jq -r '.delta_from_raw' "$meta")
+  if [[ "$delta" == "null" ]]; then
+    local raw_lines=0
+    local final_lines=0
+    [[ -f "$raw_file" ]] && raw_lines=$(_nonempty_lines_file "$raw_file")
+    [[ -f "$final_file" ]] && final_lines=$(_nonempty_lines_file "$final_file")
+    if (( raw_lines == 0 )); then
+      delta=0
+    else
+      local d=$(( final_lines - raw_lines ))
+      (( d < 0 )) && d=$(( -d ))
+      delta=$d
+    fi
+  fi
+
+  local first_kept
+  first_kept=$(jq -r '.first_output_kept' "$meta")
+  if [[ "$first_kept" == "null" ]]; then
+    if (( delta <= 2 )); then
+      first_kept=true
+    else
+      first_kept=false
+    fi
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq \
+    --arg ended "$ended_at" \
+    --argjson it "$iterations" \
+    --argjson tm "$time_mins" \
+    --argjson dr "$delta" \
+    --argjson fk "$first_kept" \
+    '.ended_at=$ended
+    | .iterations=(if .iterations == null then $it else .iterations end)
+    | .time_mins=(if .time_mins == null then $tm else .time_mins end)
+    | .delta_from_raw=(if .delta_from_raw == null then $dr else .delta_from_raw end)
+    | .first_output_kept=(if .first_output_kept == null then $fk else .first_output_kept end)' \
+    "$meta" > "$tmp" && mv "$tmp" "$meta"
+}
+
 _score_session_heuristic() {
   local session_dir=$1
   local meta="$session_dir/meta.json"
@@ -110,9 +219,21 @@ _score_session_heuristic() {
   local final_file="$session_dir/output_final.txt"
   local reflection_file="$session_dir/reflection.md"
   local events_file="$session_dir/events.jsonl"
+  local prompts_file="$session_dir/prompts.jsonl"
+  local responses_file="$session_dir/responses.jsonl"
 
   local goal_text=$(_extract_section "$prompt_file" "goal")
+  if [[ -z "${goal_text//[[:space:]]/}" ]]; then
+    goal_text=$(jq -r '.goal // ""' "$meta")
+  fi
   local prompt_text=$(_extract_section "$prompt_file" "prompt")
+  local prompt_log_text=""
+  if [[ -f "$prompts_file" ]]; then
+    prompt_log_text=$(jq -r '.prompt' "$prompts_file" 2>/dev/null | tr '\n' ' ')
+  fi
+  if [[ -n "${prompt_log_text//[[:space:]]/}" ]]; then
+    prompt_text="$prompt_log_text"
+  fi
   local followups_text=$(_extract_section "$prompt_file" "followups")
   local final_text=""
   [[ -f "$final_file" ]] && final_text=$(cat "$final_file")
@@ -129,6 +250,8 @@ _score_session_heuristic() {
   print -r -- "$prompt_text" | grep -Eiq '(must|should|acceptance|criteria|output|format|constraint)' && (( prompt_score += 1 ))
   print -r -- "$prompt_text" | grep -Eiq '(language|framework|stack|api|file|test)' && (( prompt_score += 1 ))
   (( followups_words > 0 )) && (( prompt_score += 1 ))
+  [[ -f "$prompts_file" ]] && (( prompt_score += 1 ))
+  [[ -f "$responses_file" ]] && (( prompt_score += 1 ))
   prompt_score=$(_clamp_1_10 "$prompt_score")
 
   local code_score=5
@@ -327,11 +450,34 @@ cmd_event() {
 
 # ── wit new ───────────────────────────────────────────────────────────────────
 cmd_new() {
-  [[ $# -lt 1 ]] && _err "Usage: wit new <slug> [tags...]\n  e.g. wit new auth-flow backend jwt"
+  [[ $# -lt 1 ]] && _err "Usage: wit new <slug> [tags...] [--goal \"text\"] [--open]\n  e.g. wit new auth-flow backend jwt --goal \"Build JWT login\""
 
   local root=$(_wit_root)
   local slug=$1; shift
-  local tags=("$@")
+  local tags=()
+  local goal=""
+  local no_open=1
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --goal)
+        shift
+        [[ $# -lt 1 ]] && _err "Missing value for --goal"
+        goal="$1"
+        ;;
+      --no-open)
+        no_open=1
+        ;;
+      --open)
+        no_open=0
+        ;;
+      *)
+        tags+=("$1")
+        ;;
+    esac
+    shift
+  done
+
   local date=$(date +%Y-%m-%d)
   local dir="$root/sessions/${date}_${slug}"
 
@@ -346,7 +492,7 @@ cmd_new() {
 _${date}_
 
 ## goal
-<!-- one sentence: what are you trying to build? -->
+${goal:-<!-- one sentence: what are you trying to build? -->}
 
 ## prompt
 <!-- paste the exact prompt you sent — no cleanup -->
@@ -368,6 +514,9 @@ EOF
 {
   "date": "$date",
   "slug": "$slug",
+  "started_at": "$(_iso_now_utc)",
+  "ended_at": null,
+  "goal": null,
   "skill_areas": $tags_json,
   "prompt_score": null,
   "code_score": null,
@@ -385,6 +534,11 @@ EOF
   # ── output files ──
   touch "$dir/output_raw.txt"
   touch "$dir/output_final.txt"
+
+  if [[ -n "$goal" ]]; then
+    local tmp=$(mktemp)
+    jq --arg goal "$goal" '.goal=$goal' "$dir/meta.json" > "$tmp" && mv "$tmp" "$dir/meta.json"
+  fi
 
   # ── reflection.md ──
   cat > "$dir/reflection.md" <<EOF
@@ -405,16 +559,96 @@ _${date}_
 EOF
 
   _ok "Scaffolded: sessions/${date}_${slug}/"
-  _info "Fill in the files, then run: wit commit"
+  _info "Work normally, then run: wit score && wit commit"
 
   # open in VS Code
-  if command -v code &>/dev/null; then
+  if (( no_open == 1 )); then
+    _info "No editor opened by default. Use --open if you want to open it."
+    _info "Session path: $dir"
+  elif command -v code &>/dev/null; then
     code "$dir"
     _ok "Opened in VS Code"
   else
     _warn "VS Code CLI (code) not found — open the folder manually"
     _info "$dir"
   fi
+}
+
+# ── wit goal ──────────────────────────────────────────────────────────────────
+cmd_goal() {
+  [[ $# -lt 1 ]] && _err "Usage: wit goal <text>"
+
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local goal_text="$*"
+  local meta="$session_dir/meta.json"
+  local prompt_file="$session_dir/prompt.md"
+  local tmp=$(mktemp)
+
+  jq --arg goal "$goal_text" '.goal=$goal' "$meta" > "$tmp" && mv "$tmp" "$meta"
+
+  if [[ -f "$prompt_file" ]]; then
+    awk -v g="$goal_text" '
+      BEGIN { in_goal=0; wrote=0 }
+      /^##[[:space:]]+goal[[:space:]]*$/ {
+        print
+        print g
+        in_goal=1
+        wrote=1
+        next
+      }
+      /^##[[:space:]]+/ {
+        if (in_goal) in_goal=0
+      }
+      {
+        if (!in_goal) print
+      }
+      END {
+        if (!wrote) {
+          print ""
+          print "## goal"
+          print g
+        }
+      }
+    ' "$prompt_file" > "$tmp" && mv "$tmp" "$prompt_file"
+  fi
+
+  _ok "Goal updated for current open session"
+}
+
+# ── wit prompt / wit response ────────────────────────────────────────────────
+cmd_prompt() {
+  [[ $# -lt 1 ]] && _err "Usage: wit prompt <text>"
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local prompt_text="$*"
+  local prompts_file="$session_dir/prompts.jsonl"
+  local ts=$(_iso_now_utc)
+  local slug
+  slug=$(jq -r '.slug' "$session_dir/meta.json")
+
+  jq -nc --arg ts "$ts" --arg slug "$slug" --arg prompt "$prompt_text" '{ts:$ts,slug:$slug,prompt:$prompt}' >> "$prompts_file"
+  _ok "Prompt captured"
+}
+
+cmd_response() {
+  [[ $# -lt 1 ]] && _err "Usage: wit response <text>"
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local response_text="$*"
+  local responses_file="$session_dir/responses.jsonl"
+  local ts=$(_iso_now_utc)
+  local slug
+  slug=$(jq -r '.slug' "$session_dir/meta.json")
+
+  jq -nc --arg ts "$ts" --arg slug "$slug" --arg response "$response_text" '{ts:$ts,slug:$slug,response:$response}' >> "$responses_file"
+  _ok "Response captured"
 }
 
 # ── wit score ─────────────────────────────────────────────────────────────────
@@ -452,59 +686,18 @@ cmd_commit() {
 
   _section "Committing session: $slug"
 
-  # ── auto-score first for lightweight default workflow ──
-  local prompt_score=$(jq -r '.prompt_score' "$meta")
-  local code_score=$(jq -r '.code_score' "$meta")
-  if [[ "$prompt_score" == "null" || "$code_score" == "null" ]]; then
-    _info "Auto-scoring with heuristic model..."
-    _score_session_heuristic "$session_dir"
-  fi
+  _info "Auto-scoring with heuristic model..."
+  _score_session_heuristic "$session_dir"
+  _session_metrics_autofill "$session_dir"
 
-  # ── interactive scoring only if nulls remain ──
-  local prompt_score=$(jq -r '.prompt_score' "$meta")
-  local code_score=$(jq -r '.code_score' "$meta")
-  local drift_score=$(jq -r '.drift_score' "$meta")
-  local session_score=$(jq -r '.session_score' "$meta")
-  local iterations=$(jq -r '.iterations' "$meta")
-  local time_mins=$(jq -r '.time_mins' "$meta")
-  local first_kept=$(jq -r '.first_output_kept' "$meta")
-  local delta=$(jq -r '.delta_from_raw' "$meta")
-
-  _prompt_score() {
-    local field=$1 label=$2 current=$3
-    if [[ "$current" == "null" ]]; then
-      print -n "  $label (1-10): "
-      read val
-      echo "$val"
-    else
-      echo "$current"
-    fi
-  }
-
-  if [[ "$prompt_score" == "null" ]]; then
-    print -P "\n%B%F{yellow}Score this session:%f%b"
-    print -n "  prompt clarity (1-10): "; read prompt_score
-    print -n "  code quality  (1-10): "; read code_score
-    print -n "  iterations needed:    "; read iterations
-    print -n "  time (mins):          "; read time_mins
-    print -n "  first output kept? (true/false): "; read first_kept
-    print -n "  edits made to raw output (0=none): "; read delta
-
-    # write back to meta.json
-    local tmp=$(mktemp)
-    jq \
-      --argjson ps "$prompt_score" \
-      --argjson cs "$code_score" \
-      --argjson it "$iterations" \
-      --argjson tm "$time_mins" \
-      --argjson fk "$first_kept" \
-      --argjson dr "$delta" \
-      '.prompt_score=$ps | .code_score=$cs | .iterations=$it | .time_mins=$tm | .first_output_kept=$fk | .delta_from_raw=$dr' \
-      "$meta" > "$tmp" && mv "$tmp" "$meta"
-    _ok "Scores written to meta.json"
-  fi
-
-  # refresh in case manual entry happened above
+  local prompt_score
+  local code_score
+  local drift_score
+  local session_score
+  local iterations
+  local time_mins
+  local first_kept
+  local delta
   prompt_score=$(jq -r '.prompt_score' "$meta")
   code_score=$(jq -r '.code_score' "$meta")
   drift_score=$(jq -r '.drift_score' "$meta")
@@ -645,6 +838,9 @@ ${BOLD}wit${RESET} — prompt & code quality tracker
 ${BOLD}COMMANDS${RESET}
   ${CYAN}wit init${RESET}                    scaffold the repo structure
   ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
+  ${CYAN}wit goal${RESET} <text>              set/update goal for current open session
+  ${CYAN}wit prompt${RESET} <text>            capture a prompt for current session
+  ${CYAN}wit response${RESET} <text>          capture a model response for current session
   ${CYAN}wit work${RESET}                    record terminal work into open session
   ${CYAN}wit event${RESET} <name> [value]    append event to current open session
   ${CYAN}wit score${RESET}                   auto-score current open session (heuristic)
@@ -654,6 +850,11 @@ ${BOLD}COMMANDS${RESET}
 
 ${BOLD}EXAMPLES${RESET}
   wit new auth-flow backend jwt
+  wit new auth-flow backend --goal "Build JWT login endpoint"
+  wit new auth-flow backend --goal "Build JWT login endpoint" --open
+  wit goal "Ingest synthetic catalog into Mongo and Postgres"
+  wit prompt "Build JWT login with refresh token"
+  wit response "Generated Express route and token service"
   wit work
   wit event file.change src/auth.ts
   wit event test.pass
@@ -676,6 +877,9 @@ shift 2>/dev/null || true
 case $cmd in
   init)   cmd_init "$@"   ;;
   new)    cmd_new "$@"    ;;
+  goal)   cmd_goal "$@"   ;;
+  prompt) cmd_prompt "$@" ;;
+  response) cmd_response "$@" ;;
   work)   cmd_work "$@"   ;;
   event)  cmd_event "$@"  ;;
   score)  cmd_score "$@"  ;;
