@@ -103,6 +103,141 @@ _token_overlap_percent() {
   echo $(( (common * 100) / total ))
 }
 
+_extract_first_json_object() {
+  local input=$1
+  print -r -- "$input" | awk '
+    BEGIN { start=0; depth=0 }
+    {
+      line=$0
+      for (i=1; i<=length(line); i++) {
+        c=substr(line,i,1)
+        if (!start && c=="{") start=1
+        if (start) {
+          printf "%s", c
+          if (c=="{") depth++
+          else if (c=="}") {
+            depth--
+            if (depth==0) exit
+          }
+        }
+      }
+      if (start) printf "\n"
+    }
+  '
+}
+
+_run_ollama_review() {
+  local root=$1
+  local session_dir=$2
+  local model=$3
+  local meta="$session_dir/meta.json"
+
+  command -v ollama &>/dev/null || _err "Ollama is not installed. Install from https://ollama.com and retry."
+
+  local goal
+  goal=$(jq -r '.goal // ""' "$meta")
+  if [[ -z "${goal//[[:space:]]/}" ]]; then
+    goal=$(_extract_section "$session_dir/prompt.md" "goal")
+  fi
+
+  local diff
+  diff=$(git -C "$root" diff HEAD -- . ':(exclude)sessions/**' ':(exclude)metrics/**' 2>/dev/null || true)
+  if [[ -z "${diff//[[:space:]]/}" ]]; then
+    diff=$(git -C "$root" diff -- . ':(exclude)sessions/**' ':(exclude)metrics/**' 2>/dev/null || true)
+  fi
+  if [[ -z "${diff//[[:space:]]/}" ]]; then
+    diff="No code diff detected outside wit tracking files."
+  fi
+
+  # Keep prompt size bounded for local models.
+  if (( ${#diff} > 22000 )); then
+    diff="${diff[1,22000]}\n\n[TRUNCATED]"
+  fi
+
+  local review_prompt_file
+  review_prompt_file=$(mktemp)
+  cat > "$review_prompt_file" <<EOF
+You are a strict senior code reviewer.
+Review the code changes against the goal and return ONLY JSON.
+
+Scoring rubric (1-10):
+- correctness: does it satisfy expected behavior?
+- robustness: errors, edge cases, idempotency, retries.
+- maintainability: readability, structure, naming, cohesion.
+- security: validation, secrets handling, unsafe patterns.
+- goal_alignment: how well it matches the goal.
+
+Compute quality_score as strict weighted score:
+quality_score = round(0.35*correctness + 0.20*robustness + 0.20*maintainability + 0.15*security + 0.10*goal_alignment)
+
+Risk level:
+- low, medium, high
+
+Return JSON with this exact schema:
+{
+  "quality_score": 1,
+  "risk_level": "low|medium|high",
+  "summary": "short summary",
+  "rubric": {
+    "correctness": 1,
+    "robustness": 1,
+    "maintainability": 1,
+    "security": 1,
+    "goal_alignment": 1
+  },
+  "findings": [
+    {"severity":"high|medium|low","title":"...","evidence":"...","recommendation":"..."}
+  ]
+}
+
+Goal:
+$goal
+
+Git diff:
+$diff
+EOF
+
+  local raw
+  if ! raw=$(ollama run "$model" < "$review_prompt_file" 2>&1); then
+    rm -f "$review_prompt_file"
+    _err "Ollama review failed for model '$model'. Check that the model is pulled and running."
+  fi
+  rm -f "$review_prompt_file"
+
+  local parsed
+  parsed=$(_extract_first_json_object "$raw")
+  if [[ -z "${parsed//[[:space:]]/}" ]] || ! print -r -- "$parsed" | jq -e . >/dev/null 2>&1; then
+    _err "Ollama review did not return valid JSON."
+  fi
+
+  local quality
+  local risk
+  local summary
+  quality=$(print -r -- "$parsed" | jq -r '.quality_score // null')
+  risk=$(print -r -- "$parsed" | jq -r '.risk_level // "medium"')
+  summary=$(print -r -- "$parsed" | jq -r '.summary // ""')
+  [[ "$quality" == "null" ]] && _err "Ollama review JSON missing quality_score."
+
+  local tmp
+  tmp=$(mktemp)
+  jq \
+    --argjson rs "$quality" \
+    --arg rr "$risk" \
+    --arg rsum "$summary" \
+    --arg rmodel "$model" \
+    --arg rts "$(_iso_now_utc)" \
+    --argjson findings "$(print -r -- "$parsed" | jq -c '.findings // []')" \
+    --argjson rubric "$(print -r -- "$parsed" | jq -c '.rubric // {}')" \
+    '.review_score=$rs
+    | .review_risk=$rr
+    | .review_summary=$rsum
+    | .review_model=$rmodel
+    | .review_ts=$rts
+    | .review_findings=$findings
+    | .review_rubric=$rubric' \
+    "$meta" > "$tmp" && mv "$tmp" "$meta"
+}
+
 _iso_now_utc() {
   date -u +%Y-%m-%dT%H:%M:%SZ
 }
@@ -292,6 +427,16 @@ _score_session_heuristic() {
   if [[ "$iterations" != "null" ]]; then
     (( iterations <= 2 )) && (( code_score += 1 ))
     (( iterations >= 6 )) && (( code_score -= 1 ))
+  fi
+
+  local review_score
+  local review_risk
+  review_score=$(jq -r '.review_score // null' "$meta")
+  review_risk=$(jq -r '.review_risk // ""' "$meta")
+  if [[ "$review_score" != "null" ]]; then
+    # Strictly weight LLM review higher than heuristic proxies.
+    code_score=$(( (code_score * 4 + review_score * 6 + 5) / 10 ))
+    [[ "$review_risk" == "high" ]] && (( code_score -= 1 ))
   fi
 
   code_score=$(_clamp_1_10 "$code_score")
@@ -673,6 +818,43 @@ cmd_score() {
   _info "prompt ${prompt_score}/10 · code ${code_score}/10 · drift ${drift_score}/10 · session ${session_score}/10"
 }
 
+# ── wit review ────────────────────────────────────────────────────────────────
+cmd_review() {
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+
+  local model="${WIT_OLLAMA_MODEL:-llama3.2:3b}"
+  while (( $# > 0 )); do
+    case "$1" in
+      --model)
+        shift
+        [[ $# -lt 1 ]] && _err "Missing value for --model"
+        model="$1"
+        ;;
+      *)
+        _err "Unknown argument for wit review: $1"
+        ;;
+    esac
+    shift
+  done
+
+  local meta="$session_dir/meta.json"
+  local slug
+  slug=$(jq -r '.slug' "$meta")
+
+  _section "LLM code review: $slug"
+  _info "Model: $model"
+  _run_ollama_review "$root" "$session_dir" "$model"
+
+  local score
+  local risk
+  score=$(jq -r '.review_score' "$meta")
+  risk=$(jq -r '.review_risk' "$meta")
+  _ok "Review stored in session metadata"
+  _info "review ${score}/10 · risk ${risk}"
+}
+
 # ── wit commit ────────────────────────────────────────────────────────────────
 cmd_commit() {
   local root=$(_wit_root)
@@ -685,6 +867,16 @@ cmd_commit() {
   local date=$(jq -r '.date' "$meta")
 
   _section "Committing session: $slug"
+
+  if command -v ollama &>/dev/null; then
+    local model="${WIT_OLLAMA_MODEL:-llama3.2:3b}"
+    _info "Running local LLM review with Ollama ($model)..."
+    if ! _run_ollama_review "$root" "$session_dir" "$model"; then
+      _warn "LLM review failed; continuing with heuristic scoring only"
+    fi
+  else
+    _warn "Ollama not found; skipping LLM review"
+  fi
 
   _info "Auto-scoring with heuristic model..."
   _score_session_heuristic "$session_dir"
@@ -841,6 +1033,7 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}wit goal${RESET} <text>              set/update goal for current open session
   ${CYAN}wit prompt${RESET} <text>            capture a prompt for current session
   ${CYAN}wit response${RESET} <text>          capture a model response for current session
+  ${CYAN}wit review${RESET} [--model name]    run strict local LLM code review via Ollama
   ${CYAN}wit work${RESET}                    record terminal work into open session
   ${CYAN}wit event${RESET} <name> [value]    append event to current open session
   ${CYAN}wit score${RESET}                   auto-score current open session (heuristic)
@@ -855,6 +1048,7 @@ ${BOLD}EXAMPLES${RESET}
   wit goal "Ingest synthetic catalog into Mongo and Postgres"
   wit prompt "Build JWT login with refresh token"
   wit response "Generated Express route and token service"
+  wit review --model llama3.2:3b
   wit work
   wit event file.change src/auth.ts
   wit event test.pass
@@ -880,6 +1074,7 @@ case $cmd in
   goal)   cmd_goal "$@"   ;;
   prompt) cmd_prompt "$@" ;;
   response) cmd_response "$@" ;;
+  review) cmd_review "$@" ;;
   work)   cmd_work "$@"   ;;
   event)  cmd_event "$@"  ;;
   score)  cmd_score "$@"  ;;
