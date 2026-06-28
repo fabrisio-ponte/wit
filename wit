@@ -4,6 +4,7 @@
 # usage: wit new <slug> [tags...]  |  wit commit  |  wit log  |  wit status
 
 set -euo pipefail
+setopt typeset_silent
 
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -124,6 +125,249 @@ _extract_first_json_object() {
       if (start) printf "\n"
     }
   '
+}
+
+_wit_config_file() {
+  local root=$1
+  echo "$root/.wit/config.json"
+}
+
+_ensure_wit_config() {
+  local root=$1
+  mkdir -p "$root/.wit"
+  local cfg
+  cfg=$(_wit_config_file "$root")
+  if [[ ! -f "$cfg" ]]; then
+    cat > "$cfg" <<'EOF'
+{
+  "auto_snapshot_on_prompt": true
+}
+EOF
+  fi
+}
+
+_auto_snapshot_enabled() {
+  local root=$1
+  _ensure_wit_config "$root"
+  local cfg
+  cfg=$(_wit_config_file "$root")
+  jq -e '.auto_snapshot_on_prompt // true' "$cfg" >/dev/null 2>&1
+}
+
+_set_auto_snapshot_enabled() {
+  local root=$1
+  local enabled=$2
+  _ensure_wit_config "$root"
+  local cfg
+  cfg=$(_wit_config_file "$root")
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson enabled "$enabled" '.auto_snapshot_on_prompt=$enabled' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+_capture_session_snapshot() {
+  local root=$1
+  local session_dir=$2
+  local trigger=${3:-manual}
+
+  local unstaged
+  local staged
+  local untracked
+
+  unstaged=$(git -C "$root" diff --binary -- . ':(exclude)sessions/**' ':(exclude)metrics/**' 2>/dev/null || true)
+  staged=$(git -C "$root" diff --binary --cached -- . ':(exclude)sessions/**' ':(exclude)metrics/**' 2>/dev/null || true)
+  untracked=$(git -C "$root" ls-files --others --exclude-standard 2>/dev/null | grep -Ev '^(sessions/|metrics/)' || true)
+
+  if [[ -z "${unstaged//[[:space:]]/}" && -z "${staged//[[:space:]]/}" && -z "${untracked//[[:space:]]/}" ]]; then
+    return 1
+  fi
+
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+  local snapshots_dir="$normalized_session_dir/snapshots"
+  mkdir -p "$snapshots_dir"
+  local count
+  count=$(find "$snapshots_dir" -maxdepth 1 -type f -name '*.diff' | wc -l | tr -d ' ')
+  local next=$(( count + 1 ))
+  local id
+  id=$(printf "%04d" "$next")
+  local snapshot_file="$snapshots_dir/${id}_${trigger}.diff"
+
+  local current_state
+  current_state=$(mktemp)
+  {
+    if [[ -n "${staged//[[:space:]]/}" ]]; then
+      echo "## staged diff"
+      print -r -- "$staged"
+      echo ""
+    fi
+    if [[ -n "${unstaged//[[:space:]]/}" ]]; then
+      echo "## unstaged diff"
+      print -r -- "$unstaged"
+      echo ""
+    fi
+    if [[ -n "${untracked//[[:space:]]/}" ]]; then
+      echo "## untracked files"
+      print -r -- "$untracked"
+      echo ""
+      while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        local abs="$root/$rel"
+        [[ -f "$abs" ]] || continue
+        echo "### file: $rel"
+        sed -n '1,220p' "$abs"
+        local line_count
+        line_count=$(wc -l < "$abs" | tr -d ' ')
+        if (( line_count > 220 )); then
+          echo "[TRUNCATED: showing first 220 lines of $line_count]"
+        fi
+        echo ""
+      done <<< "$untracked"
+    fi
+  } > "$current_state"
+
+  local baseline_file="$snapshots_dir/.baseline_snapshot.txt"
+  local snapshot_mode="full"
+  local payload_file="$current_state"
+
+  if [[ -f "$baseline_file" ]]; then
+    local delta_state
+    delta_state=$(mktemp)
+    diff -u -a --label previous_snapshot --label current_snapshot "$baseline_file" "$current_state" > "$delta_state" || true
+    if [[ ! -s "$delta_state" ]]; then
+      rm -f "$current_state" "$delta_state"
+      return 1
+    fi
+    snapshot_mode="incremental"
+    payload_file="$delta_state"
+  fi
+
+  {
+    echo "# wit snapshot"
+    echo "# ts: $(_iso_now_utc)"
+    echo "# trigger: $trigger"
+    echo "# mode: $snapshot_mode"
+    echo ""
+    if [[ "$snapshot_mode" == "incremental" ]]; then
+      echo "## delta since previous snapshot"
+      echo ""
+    fi
+    cat "$payload_file"
+  } > "$snapshot_file"
+
+  cp "$current_state" "$baseline_file"
+  rm -f "$current_state"
+  if [[ "$payload_file" != "$current_state" ]]; then
+    rm -f "$payload_file"
+  fi
+
+  echo "$snapshot_file"
+}
+
+_install_prompt_provenance_instructions() {
+  local root=$1
+
+  mkdir -p "$root/.github"
+  mkdir -p "$root/.wit"
+
+  local copilot_file="$root/.github/copilot-instructions.md"
+  if [[ ! -f "$copilot_file" ]]; then
+    cat > "$copilot_file" <<'EOF'
+# Prompt Provenance Instructions
+
+Always preserve prompt provenance in generated code outputs.
+
+For every code response, include this header at the top of the output file or snippet:
+
+PROMPT_PROVENANCE
+- Prompt: <exact user prompt>
+- Timestamp UTC: <iso timestamp>
+- Tool/Model: <agent or model name>
+
+Rules:
+- Keep the prompt text exact; do not paraphrase.
+- Keep code unchanged except for the provenance header.
+- If a file already contains provenance, append a new block instead of replacing history.
+EOF
+  fi
+
+  local agents_file="$root/AGENTS.md"
+  if [[ ! -f "$agents_file" ]]; then
+    cat > "$agents_file" <<'EOF'
+# AGENTS
+
+Repository policy: prompt provenance is mandatory.
+
+When generating code:
+1. Add a PROMPT_PROVENANCE block with exact prompt text and UTC timestamp.
+2. Keep prompt and code together in project artifacts.
+3. Do not remove previous provenance records from session artifacts.
+EOF
+  fi
+
+  local claude_file="$root/CLAUDE.md"
+  if [[ ! -f "$claude_file" ]]; then
+    cat > "$claude_file" <<'EOF'
+# Claude Project Instructions
+
+Prompt provenance requirement:
+- Every code artifact should preserve the exact originating prompt.
+- Add a PROMPT_PROVENANCE block at the top of generated code outputs.
+- Include Prompt, Timestamp UTC, and Tool/Model.
+EOF
+  fi
+
+  local policy_file="$root/.wit/prompt-provenance.md"
+  if [[ ! -f "$policy_file" ]]; then
+    cat > "$policy_file" <<'EOF'
+# wit Prompt Provenance Policy
+
+Goal: Keep intent and implementation traceable.
+
+Standard block:
+
+PROMPT_PROVENANCE
+- Prompt: <exact prompt text>
+- Timestamp UTC: <iso timestamp>
+- Tool/Model: <tool>
+
+This repository stores prompt/response history in sessions/* files.
+EOF
+  fi
+}
+
+_append_provenance_record() {
+  local session_dir=$1
+  local kind=$2
+  local text=$3
+
+  local file="$session_dir/provenance.md"
+  local ts=$(_iso_now_utc)
+
+  if [[ ! -f "$file" ]]; then
+    cat > "$file" <<'EOF'
+# Prompt Provenance Log
+
+This file keeps exact prompt and response history for this session.
+EOF
+  fi
+
+  {
+    echo ""
+    echo "## $ts $kind"
+    echo ""
+    echo '```text'
+    print -r -- "$text"
+    echo '```'
+  } >> "$file"
+}
+
+_normalize_session_path() {
+  local p=$1
+  while [[ "$p" == */ ]]; do
+    p=${p%/}
+  done
+  echo "$p"
 }
 
 _run_ollama_review() {
@@ -289,10 +533,50 @@ EOF
   local quality
   local risk
   local summary
-  quality=$(print -r -- "$parsed" | jq -r '.quality_score // null')
-  risk=$(print -r -- "$parsed" | jq -r '.risk_level // "medium"')
-  summary=$(print -r -- "$parsed" | jq -r '.summary // ""')
-  [[ "$quality" == "null" ]] && _err "Ollama review JSON missing quality_score."
+  quality=$(print -r -- "$parsed" | jq -r '
+    if .quality_score != null then .quality_score
+    elif .overall_score != null then .overall_score
+    elif .score != null then .score
+    elif .rating != null then .rating
+    elif .rubric != null then
+      (
+        ((.rubric.correctness // .rubric.accuracy // 5) * 0.35)
+        + ((.rubric.robustness // 5) * 0.20)
+        + ((.rubric.maintainability // 5) * 0.20)
+        + ((.rubric.security // 5) * 0.15)
+        + ((.rubric.goal_alignment // .rubric.alignment // 5) * 0.10)
+      ) | round
+    elif .scores != null then
+      (
+        ((.scores.correctness // .scores.accuracy // 5) * 0.35)
+        + ((.scores.robustness // 5) * 0.20)
+        + ((.scores.maintainability // 5) * 0.20)
+        + ((.scores.security // 5) * 0.15)
+        + ((.scores.goal_alignment // .scores.alignment // 5) * 0.10)
+      ) | round
+    else null end')
+  risk=$(print -r -- "$parsed" | jq -r '.risk_level // .risk // "medium"')
+  summary=$(print -r -- "$parsed" | jq -r '.summary // .analysis // .comment // ""')
+
+  if [[ "$quality" == "null" ]]; then
+    local debug_file="$session_dir/review_raw_output.txt"
+    print -r -- "$raw" > "$debug_file"
+    _warn "Ollama review JSON had no score field. Falling back to quality_score=5. Raw output saved to: ${debug_file#$root/}"
+    quality=5
+  fi
+
+  local rubric_json
+  local findings_json
+  rubric_json=$(print -r -- "$parsed" | jq -c '.rubric // .scores // {}')
+  findings_json=$(print -r -- "$parsed" | jq -c '.findings // .issues // []')
+
+  # Keep score in a valid 1-10 range even when models return odd values.
+  if ! [[ "$quality" =~ '^[0-9]+$' ]]; then
+    quality=$(print -r -- "$quality" | sed -E 's/[^0-9]//g')
+  fi
+  [[ -z "$quality" ]] && quality=5
+  (( quality < 1 )) && quality=1
+  (( quality > 10 )) && quality=10
 
   local tmp
   tmp=$(mktemp)
@@ -302,8 +586,8 @@ EOF
     --arg rsum "$summary" \
     --arg rmodel "$model" \
     --arg rts "$(_iso_now_utc)" \
-    --argjson findings "$(print -r -- "$parsed" | jq -c '.findings // []')" \
-    --argjson rubric "$(print -r -- "$parsed" | jq -c '.rubric // {}')" \
+    --argjson findings "$findings_json" \
+    --argjson rubric "$rubric_json" \
     '.review_score=$rs
     | .review_risk=$rr
     | .review_summary=$rsum
@@ -602,6 +886,10 @@ EOF
     _ok "Created README.md"
   fi
 
+  _install_prompt_provenance_instructions "$root"
+  _ensure_wit_config "$root"
+  _ok "Prompt provenance instructions installed"
+
   # initial commit if repo is empty
   if ! git -C "$root" log --oneline -1 &>/dev/null; then
     git -C "$root" add .
@@ -610,6 +898,12 @@ EOF
   fi
 
   _ok "wit ready. Start your first session with: wit new <slug> [tags...]"
+}
+
+cmd_install_instructions() {
+  local root=$(_wit_root)
+  _install_prompt_provenance_instructions "$root"
+  _ok "Prompt provenance instructions ensured in repo"
 }
 
 # ── wit work ──────────────────────────────────────────────────────────────────
@@ -756,6 +1050,14 @@ EOF
   touch "$dir/output_raw.txt"
   touch "$dir/output_final.txt"
 
+  cat > "$dir/provenance.md" <<'EOF'
+# Prompt Provenance Log
+
+This file keeps exact prompt and response history for this session.
+
+Use wit prompt and wit response so records stay consistent.
+EOF
+
   if [[ -n "$goal" ]]; then
     local tmp=$(mktemp)
     jq --arg goal "$goal" '.goal=$goal' "$dir/meta.json" > "$tmp" && mv "$tmp" "$dir/meta.json"
@@ -853,6 +1155,18 @@ cmd_prompt() {
   slug=$(jq -r '.slug' "$session_dir/meta.json")
 
   jq -nc --arg ts "$ts" --arg slug "$slug" --arg prompt "$prompt_text" '{ts:$ts,slug:$slug,prompt:$prompt}' >> "$prompts_file"
+  _append_provenance_record "$session_dir" "PROMPT" "$prompt_text"
+
+  if _auto_snapshot_enabled "$root"; then
+    local snapshot_path=""
+    snapshot_path=$(_capture_session_snapshot "$root" "$session_dir" "prompt" || true)
+    if [[ -n "${snapshot_path//[[:space:]]/}" ]]; then
+      _info "Snapshot captured: ${snapshot_path#$root/}"
+    else
+      _info "No code changes detected for snapshot"
+    fi
+  fi
+
   _ok "Prompt captured"
 }
 
@@ -869,6 +1183,7 @@ cmd_response() {
   slug=$(jq -r '.slug' "$session_dir/meta.json")
 
   jq -nc --arg ts "$ts" --arg slug "$slug" --arg response "$response_text" '{ts:$ts,slug:$slug,response:$response}' >> "$responses_file"
+  _append_provenance_record "$session_dir" "RESPONSE" "$response_text"
   _ok "Response captured"
 }
 
@@ -1098,6 +1413,153 @@ cmd_status() {
   git -C "$root" status --short
 }
 
+cmd_snapshot() {
+  local root=$(_wit_root)
+  local action=${1:-status}
+
+  case "$action" in
+    status)
+      if _auto_snapshot_enabled "$root"; then
+        _info "auto snapshot on prompt: ON"
+      else
+        _info "auto snapshot on prompt: OFF"
+      fi
+      ;;
+    on)
+      _set_auto_snapshot_enabled "$root" true
+      _ok "Auto snapshot on prompt enabled"
+      ;;
+    off)
+      _set_auto_snapshot_enabled "$root" false
+      _ok "Auto snapshot on prompt disabled"
+      ;;
+    now)
+      local session_dir
+      session_dir=$(_latest_open_session "$root")
+      [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+      local snapshot_path=""
+      snapshot_path=$(_capture_session_snapshot "$root" "$session_dir" "manual" || true)
+      if [[ -z "${snapshot_path//[[:space:]]/}" ]]; then
+        _warn "No code changes detected"
+      else
+        _ok "Snapshot captured: ${snapshot_path#$root/}"
+      fi
+      ;;
+    *)
+      _err "Usage: wit snapshot [status|on|off|now]"
+      ;;
+  esac
+}
+
+# ── wit explain ───────────────────────────────────────────────────────────────
+cmd_explain() {
+  local root=$(_wit_root)
+  local target_slug=${1:-}
+  local session_dir=""
+
+  if [[ -n "$target_slug" ]]; then
+    for d in "$root/sessions"/*/; do
+      [[ -f "$d/meta.json" ]] || continue
+      local slug
+      slug=$(jq -r '.slug // ""' "$d/meta.json")
+      local base
+      base=$(basename "$d")
+      if [[ "$slug" == "$target_slug" || "$base" == "$target_slug" || "$base" == *"_$target_slug" ]]; then
+        session_dir="$d"
+      fi
+    done
+  else
+    session_dir=$(_latest_open_session "$root")
+    if [[ -z "$session_dir" ]]; then
+      local latest_time=0
+      for d in "$root/sessions"/*/; do
+        [[ -f "$d/meta.json" ]] || continue
+        local mtime
+        mtime=$(stat -f %m "$d/meta.json" 2>/dev/null || stat -c %Y "$d/meta.json" 2>/dev/null)
+        if (( mtime > latest_time )); then
+          latest_time=$mtime
+          session_dir=$d
+        fi
+      done
+    fi
+  fi
+
+  [[ -z "$session_dir" ]] && _err "No matching session found. Try: wit explain <slug>"
+
+  local meta="$session_dir/meta.json"
+  local prompt_file="$session_dir/prompt.md"
+  local final_file="$session_dir/output_final.txt"
+  local slug
+  local date
+  slug=$(jq -r '.slug // "unknown"' "$meta")
+  date=$(jq -r '.date // "unknown"' "$meta")
+
+  local ps cs ds ss
+  local mode reason
+  ps=$(jq -r '.prompt_score // "null"' "$meta")
+  cs=$(jq -r '.code_score // "null"' "$meta")
+  ds=$(jq -r '.drift_score // "null"' "$meta")
+  ss=$(jq -r '.session_score // "null"' "$meta")
+  mode=$(jq -r '.scoring_mode // "unknown"' "$meta")
+  reason=$(jq -r '.score_reasoning // ""' "$meta")
+
+  local review_score review_risk review_summary
+  review_score=$(jq -r '.review_score // "null"' "$meta")
+  review_risk=$(jq -r '.review_risk // "n/a"' "$meta")
+  review_summary=$(jq -r '.review_summary // ""' "$meta")
+
+  local final_lines
+  final_lines=$(_nonempty_lines_file "$final_file")
+
+  local confidence="high"
+  local warnings=()
+  if (( final_lines == 0 )); then
+    confidence="low"
+    warnings+=("output_final.txt is empty, so overlap/output-based heuristics are weak")
+  fi
+  if [[ -f "$prompt_file" ]] && grep -Eq '<!--.*-->' "$prompt_file"; then
+    [[ "$confidence" == "high" ]] && confidence="medium"
+    warnings+=("prompt.md still contains template placeholders")
+  fi
+  if [[ "$review_score" == "null" ]]; then
+    [[ "$confidence" == "high" ]] && confidence="medium"
+    warnings+=("no LLM review score found in metadata")
+  fi
+
+  _section "Score explanation: $slug"
+  printf "  date: %s\n" "$date"
+  printf "  scoring mode: %s\n" "$mode"
+  printf "  prompt: %s/10   code: %s/10   drift: %s/10   session: %s/10\n" "$ps" "$cs" "$ds" "$ss"
+  if [[ "$ps" != "null" && "$cs" != "null" && "$ds" != "null" && "$ss" != "null" ]]; then
+    printf "  formula: (%s + %s + %s) / 3 = %s\n" "$ps" "$cs" "$ds" "$ss"
+  fi
+
+  _section "Heuristic reason"
+  if [[ -n "${reason//[[:space:]]/}" ]]; then
+    printf "  %s\n" "$reason"
+  else
+    printf "  (none recorded)\n"
+  fi
+
+  _section "LLM review"
+  printf "  score: %s/10   risk: %s\n" "$review_score" "$review_risk"
+  [[ -n "${review_summary//[[:space:]]/}" ]] && printf "  summary: %s\n" "$review_summary"
+  printf "  rubric:\n"
+  jq -r '.review_rubric // {} | to_entries[]? | "    - \(.key): \(.value)/10"' "$meta"
+  printf "  findings:\n"
+  jq -r '.review_findings // [] | if length==0 then ["    - none"] else map("    - [\(.severity)] \(.title): \(.evidence)") end | .[]' "$meta"
+
+  _section "Evidence confidence"
+  printf "  confidence: %s\n" "$confidence"
+  if (( ${#warnings[@]} > 0 )); then
+    for w in "${warnings[@]}"; do
+      printf "  - %s\n" "$w"
+    done
+  else
+    printf "  - scoring evidence looks complete for this session\n"
+  fi
+}
+
 # ── wit help ──────────────────────────────────────────────────────────────────
 cmd_help() {
   print -P "
@@ -1105,30 +1567,38 @@ ${BOLD}wit${RESET} — prompt & code quality tracker
 
 ${BOLD}COMMANDS${RESET}
   ${CYAN}wit init${RESET}                    scaffold the repo structure
+  ${CYAN}wit install-instructions${RESET}    ensure cross-agent prompt provenance instructions
   ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
   ${CYAN}wit goal${RESET} <text>              set/update goal for current open session
   ${CYAN}wit prompt${RESET} <text>            capture a prompt for current session
   ${CYAN}wit response${RESET} <text>          capture a model response for current session
   ${CYAN}wit review${RESET} [--model name]    run strict local LLM code review via Ollama
+  ${CYAN}wit snapshot${RESET} [status|on|off|now]  control/trigger code snapshots for prompt tracking
   ${CYAN}wit work${RESET}                    record terminal work into open session
   ${CYAN}wit event${RESET} <name> [value]    append event to current open session
   ${CYAN}wit score${RESET}                   auto-score current open session (heuristic)
   ${CYAN}wit commit${RESET}                  score + append to scores.jsonl + git commit
   ${CYAN}wit log${RESET}                     pretty-print session history + averages
+  ${CYAN}wit explain${RESET} [slug]          explain score reasons for latest or selected session
   ${CYAN}wit status${RESET}                  show open (uncommitted) sessions
 
 ${BOLD}EXAMPLES${RESET}
   wit new auth-flow backend jwt
+  wit install-instructions
   wit new auth-flow backend --goal "Build JWT login endpoint"
   wit new auth-flow backend --goal "Build JWT login endpoint" --open
   wit goal "Ingest synthetic catalog into Mongo and Postgres"
   wit prompt "Build JWT login with refresh token"
   wit response "Generated Express route and token service"
   wit review --model llama3.2:3b
+  wit snapshot status
+  wit snapshot now
   wit work
   wit event file.change src/auth.ts
   wit event test.pass
   wit score
+  wit explain
+  wit explain synthetic-catalog-ingest
   wit new login-form frontend react
   wit commit
   wit log
@@ -1146,16 +1616,19 @@ shift 2>/dev/null || true
 
 case $cmd in
   init)   cmd_init "$@"   ;;
+  install-instructions) cmd_install_instructions "$@" ;;
   new)    cmd_new "$@"    ;;
   goal)   cmd_goal "$@"   ;;
   prompt) cmd_prompt "$@" ;;
   response) cmd_response "$@" ;;
   review) cmd_review "$@" ;;
+  snapshot) cmd_snapshot "$@" ;;
   work)   cmd_work "$@"   ;;
   event)  cmd_event "$@"  ;;
   score)  cmd_score "$@"  ;;
   commit) cmd_commit "$@" ;;
   log)    cmd_log "$@"    ;;
+  explain) cmd_explain "$@" ;;
   status) cmd_status "$@" ;;
   help|--help|-h) cmd_help ;;
   *) _err "Unknown command: $cmd\nRun: wit help" ;;
