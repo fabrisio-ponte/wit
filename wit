@@ -198,16 +198,92 @@ $diff
 EOF
 
   local raw
-  if ! raw=$(ollama run "$model" < "$review_prompt_file" 2>&1); then
+  if ! raw=$(ollama run "$model" --format json < "$review_prompt_file" 2>/dev/null); then
     rm -f "$review_prompt_file"
     _err "Ollama review failed for model '$model'. Check that the model is pulled and running."
   fi
   rm -f "$review_prompt_file"
 
+  local sanitized
+  sanitized=$(print -r -- "$raw" | perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\].*?(\a|\e\\)//g; s/\r//g; s/[\x00-\x08\x0B\x0C\x0E-\x1F]//g')
+
   local parsed
-  parsed=$(_extract_first_json_object "$raw")
+  parsed="$sanitized"
+  if ! print -r -- "$parsed" | jq -e . >/dev/null 2>&1; then
+    parsed=$(_extract_first_json_object "$sanitized")
+  fi
+  if print -r -- "$parsed" | jq -e '.response? != null' >/dev/null 2>&1; then
+    local response_payload
+    response_payload=$(print -r -- "$parsed" | jq -r '.response')
+    if print -r -- "$response_payload" | jq -e . >/dev/null 2>&1; then
+      parsed="$response_payload"
+    else
+      local extracted_payload
+      extracted_payload=$(_extract_first_json_object "$response_payload")
+      if [[ -n "${extracted_payload//[[:space:]]/}" ]] && print -r -- "$extracted_payload" | jq -e . >/dev/null 2>&1; then
+        parsed="$extracted_payload"
+      fi
+    fi
+  fi
   if [[ -z "${parsed//[[:space:]]/}" ]] || ! print -r -- "$parsed" | jq -e . >/dev/null 2>&1; then
-    _err "Ollama review did not return valid JSON."
+    # Retry once by explicitly asking the model to normalize the prior response to JSON only.
+    local repair_prompt_file
+    repair_prompt_file=$(mktemp)
+    cat > "$repair_prompt_file" <<EOF
+You will receive text from a previous model response.
+Extract and return ONLY a valid JSON object with this exact schema and no markdown fences.
+
+{
+  "quality_score": 1,
+  "risk_level": "low|medium|high",
+  "summary": "short summary",
+  "rubric": {
+    "correctness": 1,
+    "robustness": 1,
+    "maintainability": 1,
+    "security": 1,
+    "goal_alignment": 1
+  },
+  "findings": [
+    {"severity":"high|medium|low","title":"...","evidence":"...","recommendation":"..."}
+  ]
+}
+
+If fields are missing, infer best-effort defaults.
+
+TEXT:
+$raw
+EOF
+
+    local repaired
+    repaired=$(ollama run "$model" --format json < "$repair_prompt_file" 2>/dev/null || true)
+    rm -f "$repair_prompt_file"
+
+    local repaired_sanitized
+    repaired_sanitized=$(print -r -- "$repaired" | perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\].*?(\a|\e\\)//g; s/\r//g; s/[\x00-\x08\x0B\x0C\x0E-\x1F]//g')
+
+    parsed="$repaired_sanitized"
+    if ! print -r -- "$parsed" | jq -e . >/dev/null 2>&1; then
+      parsed=$(_extract_first_json_object "$repaired_sanitized")
+    fi
+    if print -r -- "$parsed" | jq -e '.response? != null' >/dev/null 2>&1; then
+      local repaired_payload
+      repaired_payload=$(print -r -- "$parsed" | jq -r '.response')
+      if print -r -- "$repaired_payload" | jq -e . >/dev/null 2>&1; then
+        parsed="$repaired_payload"
+      else
+        local repaired_extracted
+        repaired_extracted=$(_extract_first_json_object "$repaired_payload")
+        if [[ -n "${repaired_extracted//[[:space:]]/}" ]] && print -r -- "$repaired_extracted" | jq -e . >/dev/null 2>&1; then
+          parsed="$repaired_extracted"
+        fi
+      fi
+    fi
+    if [[ -z "${parsed//[[:space:]]/}" ]] || ! print -r -- "$parsed" | jq -e . >/dev/null 2>&1; then
+      local debug_file="$session_dir/review_raw_output.txt"
+      print -r -- "$raw" > "$debug_file"
+      _err "Ollama review did not return valid JSON. Raw output saved to: ${debug_file#$root/}"
+    fi
   fi
 
   local quality
