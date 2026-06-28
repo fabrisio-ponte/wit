@@ -34,7 +34,21 @@ _wit_root() {
   echo "$root"
 }
 
-_latest_open_session() {
+_current_session_file() {
+  local root=$1
+  echo "$root/.wit/current_session"
+}
+
+_set_current_session() {
+  local root=$1
+  local session_dir=$2
+  local current_file
+  current_file=$(_current_session_file "$root")
+  mkdir -p "$root/.wit"
+  print -r -- "$(basename "$session_dir")" > "$current_file"
+}
+
+_latest_open_session_by_mtime() {
   local root=$1
   local session_dir=""
   local latest_time=0
@@ -52,6 +66,34 @@ _latest_open_session() {
   done
 
   [[ -n "$session_dir" ]] && echo "$session_dir"
+}
+
+_latest_open_session() {
+  local root=$1
+  local current_file
+  current_file=$(_current_session_file "$root")
+
+  if [[ -f "$current_file" ]]; then
+    local current_base
+    current_base=$(cat "$current_file" 2>/dev/null || true)
+    if [[ -n "${current_base//[[:space:]]/}" ]]; then
+      local current_dir="$root/sessions/$current_base"
+      if [[ -f "$current_dir/meta.json" ]]; then
+        local rel="sessions/$current_base"
+        if git -C "$root" status --porcelain "$rel" | grep -q .; then
+          echo "$current_dir"
+          return
+        fi
+      fi
+    fi
+  fi
+
+  local fallback
+  fallback=$(_latest_open_session_by_mtime "$root")
+  if [[ -n "${fallback//[[:space:]]/}" ]]; then
+    _set_current_session "$root" "$fallback"
+    echo "$fallback"
+  fi
 }
 
 _clamp_1_10() {
@@ -75,7 +117,7 @@ _extract_section() {
 
 _word_count_text() {
   local text=$1
-  print -r -- "$text" | tr -cs '[:alnum:]' '\n' | awk 'NF { c++ } END { print c+0 }'
+  LC_ALL=C print -r -- "$text" | LC_ALL=C tr -cs '[:alnum:]' '\n' | awk 'NF { c++ } END { print c+0 }'
 }
 
 _nonempty_lines_file() {
@@ -89,12 +131,15 @@ _token_overlap_percent() {
   local b=$2
   local fa=$(mktemp)
   local fb=$(mktemp)
-  print -r -- "$a" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fa"
-  print -r -- "$b" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fb"
+  LC_ALL=C print -r -- "$a" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fa"
+  LC_ALL=C print -r -- "$b" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs '[:alnum:]' '\n' | awk 'length($0)>=3' | sort -u > "$fb"
 
   local common=$(comm -12 "$fa" "$fb" | wc -l | tr -d ' ')
   local total=$(cat "$fa" "$fb" | sort -u | wc -l | tr -d ' ')
   rm -f "$fa" "$fb"
+
+  [[ -z "$common" ]] && common=0
+  [[ -z "$total" ]] && total=0
 
   if (( total == 0 )); then
     echo 50
@@ -156,13 +201,169 @@ _auto_snapshot_enabled() {
 
 _set_auto_snapshot_enabled() {
   local root=$1
-  local enabled=$2
+  local enabled=$2  wit review --model llama3.2:3b
+  wit score
+  wit explain api-setup
   _ensure_wit_config "$root"
   local cfg
   cfg=$(_wit_config_file "$root")
   local tmp
   tmp=$(mktemp)
   jq --argjson enabled "$enabled" '.auto_snapshot_on_prompt=$enabled' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+_read_repo_context_file() {
+  local root=$1
+  local rel=$2
+  local abs="$root/$rel"
+  [[ -f "$abs" ]] || return 0
+
+  echo "[$rel]"
+  sed -n '1,400p' "$abs"
+  echo ""
+}
+
+_build_prompt_payload() {
+  local root=$1
+  local user_prompt=$2
+
+  {
+    echo "=== REPOSITORY CONTEXT ==="
+    _read_repo_context_file "$root" "AGENTS.md"
+    echo "=== END REPOSITORY CONTEXT ==="
+    echo ""
+    echo "=== USER PROMPT ==="
+    print -r -- "$user_prompt"
+  }
+}
+
+_update_prompt_section() {
+  local prompt_file=$1
+  local new_prompt=$2
+  [[ -f "$prompt_file" ]] || return 0
+
+  local tmp
+  tmp=$(mktemp)
+  awk -v p="$new_prompt" '
+    BEGIN { in_prompt=0; wrote=0 }
+    /^##[[:space:]]+prompt[[:space:]]*$/ {
+      print
+      print p
+      in_prompt=1
+      wrote=1
+      next
+    }
+    /^##[[:space:]]+/ {
+      if (in_prompt) in_prompt=0
+    }
+    {
+      if (!in_prompt) print
+    }
+    END {
+      if (!wrote) {
+        print ""
+        print "## prompt"
+        print p
+      }
+    }
+  ' "$prompt_file" > "$tmp" && mv "$tmp" "$prompt_file"
+}
+
+_autofill_output_final_if_empty() {
+  local root=$1
+  local session_dir=$2
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+  local final_file="$normalized_session_dir/output_final.txt"
+
+  [[ -f "$final_file" ]] || : > "$final_file"
+  if (( $(_nonempty_lines_file "$final_file") > 0 )); then
+    return 0
+  fi
+
+  local files
+  files=$(git -C "$root" diff --name-only -- . ':(exclude)sessions/**' ':(exclude)metrics/**' 2>/dev/null || true)
+  local untracked
+  untracked=$(git -C "$root" ls-files --others --exclude-standard 2>/dev/null | grep -Ev '^(sessions/|metrics/)' || true)
+  local merged
+  merged=$(printf "%s\n%s\n" "$files" "$untracked" | awk 'NF' | awk '!seen[$0]++')
+
+  [[ -z "${merged//[[:space:]]/}" ]] && return 0
+
+  {
+    echo "# AUTO-EVIDENCE"
+    echo "# Populated by wit from changed workspace files because output_final.txt was empty"
+    echo ""
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      local abs="$root/$rel"
+      [[ -f "$abs" ]] || continue
+
+      # Ignore common generated/artifact paths that add noise to evidence.
+      case "$rel" in
+        .git/*|.venv/*|venv/*|node_modules/*|dist/*|build/*|target/*|coverage/*|.pytest_cache/*|__pycache__/*|*/__pycache__/*)
+          continue
+          ;;
+      esac
+
+      # Ignore common binary/compiled artifact extensions.
+      case "$rel" in
+        *.pyc|*.pyo|*.so|*.dylib|*.a|*.o|*.class|*.jar|*.zip|*.gz|*.tar|*.tgz|*.7z|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.pdf|*.db|*.sqlite|*.sqlite3|*.woff|*.woff2|*.ttf|*.otf)
+          continue
+          ;;
+      esac
+
+      local mime
+      mime=$(file -b --mime "$abs" 2>/dev/null || true)
+      if [[ "$mime" == *"charset=binary"* ]]; then
+        continue
+      fi
+
+      # Skip binary files to keep evidence text-safe and scoring stable.
+      if ! LC_ALL=C grep -Iq . "$abs" 2>/dev/null; then
+        continue
+      fi
+
+      echo "## $rel"
+      sed -n '1,260p' "$abs"
+      local lc
+      lc=$(wc -l < "$abs" | tr -d ' ')
+      if (( lc > 260 )); then
+        echo "[TRUNCATED: showing first 260 lines of $lc]"
+      fi
+      echo ""
+    done <<< "$merged"
+  } > "$final_file"
+
+  _info "Auto-filled output evidence: ${final_file#$root/}"
+}
+
+_record_prompt_entry() {
+  local root=$1
+  local session_dir=$2
+  local prompt_text=$3
+
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+
+  local prompts_file="$normalized_session_dir/prompts.jsonl"
+  local ts=$(_iso_now_utc)
+  local slug
+  slug=$(jq -r '.slug' "$normalized_session_dir/meta.json")
+
+  jq -nc --arg ts "$ts" --arg slug "$slug" --arg prompt "$prompt_text" '{ts:$ts,slug:$slug,prompt:$prompt}' >> "$prompts_file"
+  _append_provenance_record "$normalized_session_dir" "PROMPT" "$prompt_text"
+  _update_prompt_section "$normalized_session_dir/prompt.md" "$prompt_text"
+
+  if _auto_snapshot_enabled "$root"; then
+    local snapshot_path=""
+    snapshot_path=$(_capture_session_snapshot "$root" "$normalized_session_dir" "prompt" || true)
+    if [[ -n "${snapshot_path//[[:space:]]/}" ]]; then
+      _info "Snapshot captured: ${snapshot_path#$root/}"
+    else
+      _info "No code changes detected for snapshot"
+    fi
+  fi
 }
 
 _capture_session_snapshot() {
@@ -965,13 +1166,14 @@ cmd_event() {
 
 # ── wit new ───────────────────────────────────────────────────────────────────
 cmd_new() {
-  [[ $# -lt 1 ]] && _err "Usage: wit new <slug> [tags...] [--goal \"text\"] [--open]\n  e.g. wit new auth-flow backend jwt --goal \"Build JWT login\""
+  [[ $# -lt 1 ]] && _err "Usage: wit new <slug> [tags...] [--goal \"text\"] [--open] [--force]\n  e.g. wit new auth-flow backend jwt --goal \"Build JWT login\""
 
   local root=$(_wit_root)
   local slug=$1; shift
   local tags=()
   local goal=""
   local no_open=1
+  local force_open_new=0
 
   while (( $# > 0 )); do
     case "$1" in
@@ -986,6 +1188,9 @@ cmd_new() {
       --open)
         no_open=0
         ;;
+      --force)
+        force_open_new=1
+        ;;
       *)
         tags+=("$1")
         ;;
@@ -995,6 +1200,18 @@ cmd_new() {
 
   local date=$(date +%Y-%m-%d)
   local dir="$root/sessions/${date}_${slug}"
+
+  local open_sessions=0
+  for d in "$root/sessions"/*/; do
+    [[ -f "$d/meta.json" ]] || continue
+    local rel="sessions/$(basename "$d")"
+    if git -C "$root" status --porcelain "$rel" | grep -q .; then
+      (( open_sessions += 1 ))
+    fi
+  done
+  if (( open_sessions > 0 && force_open_new == 0 )); then
+    _err "You already have ${open_sessions} open session(s). Finish current work first with: wit commit\nOr run: wit status\nTo bypass intentionally: wit new <slug> ... --force"
+  fi
 
   [[ -d "$dir" ]] && _err "Session already exists: $dir"
 
@@ -1081,6 +1298,8 @@ _${date}_
 <!-- one concrete thing to try differently next time -->
 EOF
 
+  _set_current_session "$root" "$dir"
+
   _ok "Scaffolded: sessions/${date}_${slug}/"
   _info "Work normally, then run: wit score && wit commit"
 
@@ -1104,6 +1323,8 @@ cmd_goal() {
   local root=$(_wit_root)
   local session_dir=$(_latest_open_session "$root")
   [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
 
   local goal_text="$*"
   local meta="$session_dir/meta.json"
@@ -1143,31 +1364,167 @@ cmd_goal() {
 
 # ── wit prompt / wit response ────────────────────────────────────────────────
 cmd_prompt() {
-  [[ $# -lt 1 ]] && _err "Usage: wit prompt <text>"
+  [[ $# -lt 1 ]] && _err "Usage: wit prompt [--model <name>] [--send-local] [--capture-only] <text>"
   local root=$(_wit_root)
   local session_dir=$(_latest_open_session "$root")
   [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+
+  local model="${WIT_PROMPT_MODEL:-llama3.2:3b}"
+  local send_local=0
+  local capture_only=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --model)
+        shift
+        [[ $# -lt 1 ]] && _err "Missing value for --model"
+        model="$1"
+        ;;
+      --send-local)
+        send_local=1
+        ;;
+      --capture-only)
+        capture_only=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        _err "Unknown argument for wit prompt: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+
+  [[ $# -lt 1 ]] && _err "Usage: wit prompt [--model <name>] [--send-local] [--capture-only] <text>"
 
   local prompt_text="$*"
-  local prompts_file="$session_dir/prompts.jsonl"
+  local responses_file="$normalized_session_dir/responses.jsonl"
+  local payload_file="$normalized_session_dir/last_prompt_payload.txt"
+  local raw_file="$normalized_session_dir/output_raw.txt"
   local ts=$(_iso_now_utc)
   local slug
-  slug=$(jq -r '.slug' "$session_dir/meta.json")
+  slug=$(jq -r '.slug' "$normalized_session_dir/meta.json")
 
-  jq -nc --arg ts "$ts" --arg slug "$slug" --arg prompt "$prompt_text" '{ts:$ts,slug:$slug,prompt:$prompt}' >> "$prompts_file"
-  _append_provenance_record "$session_dir" "PROMPT" "$prompt_text"
+  _record_prompt_entry "$root" "$normalized_session_dir" "$prompt_text"
 
-  if _auto_snapshot_enabled "$root"; then
-    local snapshot_path=""
-    snapshot_path=$(_capture_session_snapshot "$root" "$session_dir" "prompt" || true)
-    if [[ -n "${snapshot_path//[[:space:]]/}" ]]; then
-      _info "Snapshot captured: ${snapshot_path#$root/}"
-    else
-      _info "No code changes detected for snapshot"
+  local payload
+  payload=$(_build_prompt_payload "$root" "$prompt_text")
+  print -r -- "$payload" > "$payload_file"
+  _info "Context payload saved: ${payload_file#$root/}"
+
+  if (( capture_only == 1 || send_local == 0 )); then
+    if (( send_local == 0 )); then
+      _info "Use: wit context --copy \"<prompt>\" to send this context to external chat agents"
     fi
+    _ok "Prompt captured"
+    return 0
   fi
 
+  if ! command -v ollama &>/dev/null; then
+    _warn "Ollama not found; prompt captured only. Use --capture-only or install Ollama to auto-send."
+    _ok "Prompt captured"
+    return 0
+  fi
+
+  local response_text
+  if ! response_text=$(print -r -- "$payload" | ollama run "$model" 2>/dev/null); then
+    _warn "Ollama prompt send failed for model '$model'. Prompt was captured; run wit response manually if needed."
+    _ok "Prompt captured"
+    return 0
+  fi
+
+  jq -nc --arg ts "$ts" --arg slug "$slug" --arg response "$response_text" --arg model "$model" \
+    '{ts:$ts,slug:$slug,response:$response,model:$model,source:"wit.prompt"}' >> "$responses_file"
+  _append_provenance_record "$normalized_session_dir" "RESPONSE" "$response_text"
+
+  {
+    echo ""
+    echo "## $ts MODEL_RESPONSE ($model)"
+    echo ""
+    print -r -- "$response_text"
+  } >> "$raw_file"
+
+  _ok "Model response captured"
+  print -r -- "$response_text"
+
   _ok "Prompt captured"
+}
+
+cmd_capture_prompt() {
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+
+  local prompt_text=""
+  if (( $# > 0 )); then
+    prompt_text="$*"
+  else
+    local pending_file="$normalized_session_dir/pending_prompt.txt"
+    [[ -f "$pending_file" ]] || _err "No pending prompt found. Use: wit context --copy \"<prompt>\" first, or pass text to wit capture-prompt."
+    prompt_text=$(cat "$pending_file")
+  fi
+
+  [[ -z "${prompt_text//[[:space:]]/}" ]] && _err "Prompt text is empty."
+  _record_prompt_entry "$root" "$normalized_session_dir" "$prompt_text"
+  _ok "Prompt captured"
+}
+
+cmd_context() {
+  [[ $# -lt 1 ]] && _err "Usage: wit context [--copy] <text>"
+  local root=$(_wit_root)
+  local session_dir=$(_latest_open_session "$root")
+  [[ -z "$session_dir" ]] && _err "No open session found. Start one with: wit new <slug>"
+  local normalized_session_dir
+  normalized_session_dir=$(_normalize_session_path "$session_dir")
+  local copy_to_clipboard=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --copy)
+        copy_to_clipboard=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        _err "Unknown argument for wit context: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+
+  [[ $# -lt 1 ]] && _err "Usage: wit context [--copy] <text>"
+  local user_prompt="$*"
+  local payload
+  payload=$(_build_prompt_payload "$root" "$user_prompt")
+
+  print -r -- "$payload" > "$normalized_session_dir/last_prompt_payload.txt"
+  print -r -- "$user_prompt" > "$normalized_session_dir/pending_prompt.txt"
+  _info "Context payload saved: sessions/$(basename "$normalized_session_dir")/last_prompt_payload.txt"
+  _info "Pending prompt saved: sessions/$(basename "$normalized_session_dir")/pending_prompt.txt"
+
+  if (( copy_to_clipboard == 1 )); then
+    if command -v pbcopy &>/dev/null; then
+      print -r -- "$payload" | pbcopy
+      _ok "Context copied to clipboard"
+      return 0
+    fi
+    _warn "pbcopy not found; printing payload instead"
+  fi
+
+  print -r -- "$payload"
 }
 
 cmd_response() {
@@ -1178,13 +1535,29 @@ cmd_response() {
 
   local response_text="$*"
   local responses_file="$session_dir/responses.jsonl"
+  local final_file="$session_dir/output_final.txt"
   local ts=$(_iso_now_utc)
   local slug
   slug=$(jq -r '.slug' "$session_dir/meta.json")
 
   jq -nc --arg ts "$ts" --arg slug "$slug" --arg response "$response_text" '{ts:$ts,slug:$slug,response:$response}' >> "$responses_file"
   _append_provenance_record "$session_dir" "RESPONSE" "$response_text"
+
+  # Keep output_final in sync with captured responses for a simpler workflow.
+  [[ -f "$final_file" ]] || : > "$final_file"
+  if (( $(_nonempty_lines_file "$final_file") == 0 )); then
+    print -r -- "$response_text" > "$final_file"
+  else
+    {
+      echo ""
+      echo "## $ts RESPONSE"
+      echo ""
+      print -r -- "$response_text"
+    } >> "$final_file"
+  fi
+
   _ok "Response captured"
+  _info "Updated output evidence: ${final_file#$root/}"
 }
 
 # ── wit score ─────────────────────────────────────────────────────────────────
@@ -1198,6 +1571,7 @@ cmd_score() {
   local slug=$(jq -r '.slug' "$meta")
 
   _section "Auto-scoring session: $slug"
+  _autofill_output_final_if_empty "$root" "$session_dir"
   _score_session_heuristic "$session_dir"
 
   local prompt_score=$(jq -r '.prompt_score' "$meta")
@@ -1270,6 +1644,7 @@ cmd_commit() {
   fi
 
   _info "Auto-scoring with heuristic model..."
+  _autofill_output_final_if_empty "$root" "$session_dir"
   _score_session_heuristic "$session_dir"
   _session_metrics_autofill "$session_dir"
 
@@ -1358,7 +1733,7 @@ cmd_log() {
     printf "  ${DIM}%s${RESET}  ${BOLD}%-24s${RESET}  prompt ${p_col}%2s/10${RESET}  code ${c_col}%2s/10${RESET}  drift %2s/10  session %2s/10  ${DIM}%s · %s iter · %s min · %s${RESET}\n" \
       "$date" "$slug" "$ps" "$cs" "$ds" "$ss" "$mode" "$it" "$tm" "$areas"
 
-    (( count++ ))
+    (( count += 1 ))
     (( total_prompt += ps ))
     (( total_code   += cs ))
   done < "$scores"
@@ -1390,27 +1765,57 @@ cmd_log() {
 # ── wit status ────────────────────────────────────────────────────────────────
 cmd_status() {
   local root=$(_wit_root)
+  local active_session=""
+  active_session=$(_latest_open_session "$root" || true)
 
   _section "wit status"
 
   # uncommitted session folders
   local found=0
+  local open_count=0
   for d in "$root/sessions"/*/; do
     [[ -f "$d/meta.json" ]] || continue
     local rel="sessions/$(basename $d)"
     if git -C "$root" status --porcelain "$rel" | grep -q .; then
       local slug=$(jq -r '.slug' "$d/meta.json")
       local ps=$(jq -r '.prompt_score' "$d/meta.json")
-      _info "Open session: ${BOLD}$slug${RESET} $([ "$ps" = "null" ] && echo "${YELLOW}(not yet scored)${RESET}" || echo "prompt ${ps}/10")"
+      local label="Open session"
+      [[ "${d%/}" == "${active_session%/}" ]] && label="Active session"
+      _info "${label}: ${BOLD}$slug${RESET} $([ "$ps" = "null" ] && echo "${YELLOW}(not yet scored)${RESET}" || echo "prompt ${ps}/10")"
       found=1
+      (( open_count += 1 ))
     fi
   done
+
+  if (( open_count > 1 )); then
+    _warn "Multiple open sessions detected ($open_count). Recommended: work one session at a time."
+  fi
 
   (( found == 0 )) && _ok "Nothing open. Start one with: wit new <slug> [tags...]"
 
   # quick git status
   echo ""
   git -C "$root" status --short
+}
+
+cmd_flow() {
+  print -P "
+${BOLD}wit standard flow (external chat)${RESET}
+  1) ${CYAN}wit new <slug> [tags...] --goal \"...\"${RESET}
+  2) ${CYAN}wit context --copy \"your prompt\"${RESET}
+  3) paste in chat tool and apply code changes
+  4) ${CYAN}wit capture-prompt${RESET}
+  5) ${CYAN}wit response \"model output summary/text\"${RESET}
+  6) ${CYAN}wit review --model llama3.2:3b${RESET}
+  7) ${CYAN}wit score${RESET}
+  8) ${CYAN}wit explain <slug>${RESET}
+  9) ${CYAN}wit commit${RESET}
+
+${BOLD}notes${RESET}
+  - ${CYAN}wit prompt${RESET} is useful for direct capture/local model workflows.
+  - Prefer a single open session at a time for cleaner scoring.
+  - ${CYAN}wit response${RESET} now also updates ${CYAN}output_final.txt${RESET} automatically.
+"
 }
 
 cmd_snapshot() {
@@ -1568,10 +1973,13 @@ ${BOLD}wit${RESET} — prompt & code quality tracker
 ${BOLD}COMMANDS${RESET}
   ${CYAN}wit init${RESET}                    scaffold the repo structure
   ${CYAN}wit install-instructions${RESET}    ensure cross-agent prompt provenance instructions
-  ${CYAN}wit new${RESET} <slug> [tags...]    start a new session
+  ${CYAN}wit new${RESET} <slug> [tags...]    start a new session (blocked if another is open; use --force to override)
   ${CYAN}wit goal${RESET} <text>              set/update goal for current open session
-  ${CYAN}wit prompt${RESET} <text>            capture a prompt for current session
-  ${CYAN}wit response${RESET} <text>          capture a model response for current session
+  ${CYAN}wit prompt${RESET} [--model name] [--send-local] [--capture-only] <text>  capture prompt and compose repo context
+  ${CYAN}wit context${RESET} [--copy] <text>  print/copy full repository-context payload for external chat agents
+  ${CYAN}wit capture-prompt${RESET} [text]  capture pending or explicit prompt into session log + provenance + snapshot
+  ${CYAN}wit flow${RESET}                    show recommended end-to-end workflow
+  ${CYAN}wit response${RESET} <text>          capture a model response and update output_final.txt
   ${CYAN}wit review${RESET} [--model name]    run strict local LLM code review via Ollama
   ${CYAN}wit snapshot${RESET} [status|on|off|now]  control/trigger code snapshots for prompt tracking
   ${CYAN}wit work${RESET}                    record terminal work into open session
@@ -1587,8 +1995,15 @@ ${BOLD}EXAMPLES${RESET}
   wit install-instructions
   wit new auth-flow backend --goal "Build JWT login endpoint"
   wit new auth-flow backend --goal "Build JWT login endpoint" --open
+  wit new auth-flow backend --goal "Build JWT login endpoint" --force
   wit goal "Ingest synthetic catalog into Mongo and Postgres"
+  wit context --copy "Build JWT login with refresh token"
+  # paste payload into external chat tool, then after edits:
+  wit capture-prompt
+  wit flow
   wit prompt "Build JWT login with refresh token"
+  wit prompt --capture-only "Record prompt without sending to model"
+  wit prompt --model llama3.2:3b --send-local "Build JWT login with refresh token"
   wit response "Generated Express route and token service"
   wit review --model llama3.2:3b
   wit snapshot status
@@ -1620,6 +2035,9 @@ case $cmd in
   new)    cmd_new "$@"    ;;
   goal)   cmd_goal "$@"   ;;
   prompt) cmd_prompt "$@" ;;
+  context) cmd_context "$@" ;;
+  capture-prompt) cmd_capture_prompt "$@" ;;
+  flow) cmd_flow ;;
   response) cmd_response "$@" ;;
   review) cmd_review "$@" ;;
   snapshot) cmd_snapshot "$@" ;;
