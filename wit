@@ -1316,6 +1316,45 @@ EOF
   fi
 }
 
+# ── wit resume ──────────────────────────────────────────────────────────────
+cmd_resume() {
+  [[ $# -lt 1 ]] && _err "Usage: wit resume <slug>"
+
+  local root=$(_wit_root)
+  local target_slug=${1:-}
+  local session_dir=""
+  local latest_time=0
+
+  for d in "$root/sessions"/*/; do
+    [[ -f "$d/meta.json" ]] || continue
+    local slug
+    slug=$(jq -r '.slug // ""' "$d/meta.json")
+    local base
+    base=$(basename "$d")
+    if [[ "$slug" == "$target_slug" || "$base" == "$target_slug" || "$base" == *"_$target_slug" ]]; then
+      local mtime
+      mtime=$(stat -f %m "$d/meta.json" 2>/dev/null || stat -c %Y "$d/meta.json" 2>/dev/null)
+      if (( mtime >= latest_time )); then
+        latest_time=$mtime
+        session_dir="$d"
+      fi
+    fi
+  done
+
+  [[ -z "$session_dir" ]] && _err "No matching session found. Try: wit log and use wit resume <slug>"
+
+  local meta="$session_dir/meta.json"
+  local slug
+  slug=$(jq -r '.slug // "unknown"' "$meta")
+
+  jq --arg resumed "$(_iso_now_utc)" '.resumed_at=$resumed' "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+  _append_provenance_record "$session_dir" "RESUME" "Resumed session for continued work."
+  _set_current_session "$root" "$session_dir"
+
+  _ok "Resumed session: $slug"
+  _info "Current session set to: ${session_dir#$root/}"
+}
+
 # ── wit goal ──────────────────────────────────────────────────────────────────
 cmd_goal() {
   [[ $# -lt 1 ]] && _err "Usage: wit goal <text>"
@@ -1974,6 +2013,7 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}wit init${RESET}                    scaffold the repo structure
   ${CYAN}wit install-instructions${RESET}    ensure cross-agent prompt provenance instructions
   ${CYAN}wit new${RESET} <slug> [tags...]    start a new session (blocked if another is open; use --force to override)
+  ${CYAN}wit resume${RESET} <slug>           re-open a prior session and keep building
   ${CYAN}wit goal${RESET} <text>              set/update goal for current open session
   ${CYAN}wit prompt${RESET} [--model name] [--send-local] [--capture-only] <text>  capture prompt and compose repo context
   ${CYAN}wit context${RESET} [--copy] <text>  print/copy full repository-context payload for external chat agents
@@ -1996,6 +2036,7 @@ ${BOLD}EXAMPLES${RESET}
   wit new auth-flow backend --goal "Build JWT login endpoint"
   wit new auth-flow backend --goal "Build JWT login endpoint" --open
   wit new auth-flow backend --goal "Build JWT login endpoint" --force
+  wit resume auth-flow
   wit goal "Ingest synthetic catalog into Mongo and Postgres"
   wit context --copy "Build JWT login with refresh token"
   # paste payload into external chat tool, then after edits:
@@ -2033,6 +2074,7 @@ case $cmd in
   init)   cmd_init "$@"   ;;
   install-instructions) cmd_install_instructions "$@" ;;
   new)    cmd_new "$@"    ;;
+  resume) cmd_resume "$@" ;;
   goal)   cmd_goal "$@"   ;;
   prompt) cmd_prompt "$@" ;;
   context) cmd_context "$@" ;;
